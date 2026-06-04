@@ -1,0 +1,106 @@
+{
+  "seed": 0,
+  "data": {
+    "source": "multicube",
+    "manifest": "/mnt/data/cubes/cubes.json",
+    "patch": [
+      64,
+      64,
+      64
+    ],
+    "occupancy_min": 0.5,
+    "norm_low_pct": 0.5,
+    "norm_high_pct": 99.5,
+    "augment": true,
+    "augment_inplane_only": false
+  },
+  "degradation": {
+    "sigma_xy": [
+      0.6,
+      1.3
+    ],
+    "sigma_z": [
+      0.9,
+      1.8
+    ],
+    "noise_sigma": [
+      0.005,
+      0.03
+    ],
+    "noise_color": [
+      0.0,
+      1.2
+    ],
+    "shift": [
+      -0.5,
+      0.5
+    ],
+    "intensity_gain": [
+      0.9,
+      1.1
+    ],
+    "intensity_bias": [
+      -0.03,
+      0.03
+    ],
+    "u8_quantize": true
+  },
+  "model": {
+    "in_ch": 1,
+    "base_width": 32,
+    "levels": 3,
+    "blocks_per_level": 2,
+    "residual": true,
+    "grad_checkpoint": false,
+    "scale_cond": true,
+    "cond_dim": 64
+  },
+  "loss": {
+    "charbonnier_eps": 0.001,
+    "mask_air": true,
+    "data_consistency_weight": 0.3
+  },
+  "train": {
+    "steps": 20000,
+    "batch_size": 8,
+    "lr": 0.0002,
+    "lr_schedule": "cosine",
+    "warmup_steps": 1000,
+    "lr_min_frac": 0.05,
+    "weight_decay": 0.0001,
+    "num_workers": 7,
+    "prefetch_factor": 6,
+    "grad_clip": 1.0,
+    "gpu_degrade": true,
+    "fused_optimizer": true,
+    "compile": "max-autotune",
+    "compile_dynamic": false,
+    "compile_fullgraph": true,
+    "log_every": 50,
+    "val_every": 1000,
+    "ckpt_every": 1000,
+    "ckpt_dir": "/mnt/data/checkpoints/scale_deconv",
+    "s3_sync": "s3://YOUR_BUCKET/YOUR_PREFIX/superres/runs/scale_deconv",
+    "amp_bf16": true,
+    "deconv_input": true,
+    "deconv_reg": 0.05
+  },
+  "infer": {
+    "window": [
+      128,
+      128,
+      128
+    ],
+    "overlap": 16,
+    "occupancy_skip": true,
+    "amp_bf16": true
+  },
+  "physics": {
+    "paganin_delta_beta": 1000.0,
+    "energy_kev": 78.0,
+    "sample_detector_mm": 220.0,
+    "sample_pixel_mm": 0.0024,
+    "unsharp_sigma": 1.2,
+    "unsharp_coeff": 4.0
+  }
+}
