@@ -24,27 +24,37 @@ import math
 
 import numpy as np
 
-# physical constants
-_H_PLANCK_KEV_S = 4.135667696e-18      # Planck constant in keV*s
-_C_M_PER_S = 2.99792458e8
+# Constant from nabu (keV*micron); wavelength_micron = _HC_KEV_UM / energy_keV.
+_HC_KEV_UM = 1.23984199e-3
+
+
+def wavelength_micron(energy_kev: float) -> float:
+    """X-ray wavelength in MICRONS from energy (keV), matching nabu's constant."""
+    return _HC_KEV_UM / energy_kev
 
 
 def wavelength_m(energy_kev: float) -> float:
-    """X-ray wavelength (meters) from photon energy (keV)."""
-    return _H_PLANCK_KEV_S * _C_M_PER_S / energy_kev
+    """X-ray wavelength in meters (kept for tests/back-compat)."""
+    return wavelength_micron(energy_kev) * 1e-6
 
 
 def paganin_transfer(k_cyc_per_voxel: np.ndarray, delta_beta: float, energy_kev: float,
                      sample_detector_mm: float, sample_pixel_um: float) -> np.ndarray:
-    """Paganin low-pass transfer function T(k), evaluated at frequencies in
-    cycles/voxel. <1 everywhere, ->0 at high freq (it's a blur).
+    """Paganin low-pass transfer, EXACTLY matching nabu's PaganinPhaseRetrieval:
+
+        filter = 1 / (1 + db * L * D * pi * k2)
+
+    where k2 = (fy^2 + fx^2) with fy = fftfreq(n, d=pixel_size_micron) i.e. spatial
+    frequency in CYCLES/MICRON, L = wavelength (micron), D = distance (micron).
+    (nabu/preproc/phase.py: compute_filter). We take `k_cyc_per_voxel` (our spectrum
+    convention) and convert to cycles/micron by dividing by the pixel size.
     """
-    lam = wavelength_m(energy_kev)                 # m
-    z = sample_detector_mm * 1e-3                   # m
-    px = sample_pixel_um * 1e-6                      # m/voxel
-    # k in cycles/voxel -> radians/meter:  k_phys = 2*pi * (k_cyc_per_voxel / px)
-    k_phys = 2.0 * math.pi * (k_cyc_per_voxel / px)
-    denom = 1.0 + delta_beta * lam * z * (k_phys ** 2) / (4.0 * math.pi)
+    L = wavelength_micron(energy_kev)              # micron
+    D = sample_detector_mm * 1000.0                 # mm -> micron
+    # cycles/voxel -> cycles/micron: divide by micron-per-voxel (= sample_pixel_um)
+    f_cyc_per_um = k_cyc_per_voxel / sample_pixel_um
+    k2 = f_cyc_per_um ** 2
+    denom = 1.0 + delta_beta * L * D * math.pi * k2
     return 1.0 / denom
 
 
