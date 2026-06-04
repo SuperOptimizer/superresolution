@@ -220,9 +220,12 @@ def train(config_path: str, smoke: bool = False, max_steps: int | None = None,
                               dynamic=c_dynamic, fullgraph=c_fullgraph)
     print(f"model params: {n_params:,}  device: {device}  bf16={use_amp}  "
           f"compile={compile_mode}  source={cfg['data'].get('source')}")
-    opt = torch.optim.AdamW(
-        model.parameters(), lr=float(tcfg["lr"]), weight_decay=float(tcfg["weight_decay"])
-    )
+    # fused=True runs the AdamW update as a single fused CUDA kernel (less launch
+    # overhead than the default for-loop / foreach paths). Free on CUDA.
+    opt_kwargs = dict(lr=float(tcfg["lr"]), weight_decay=float(tcfg["weight_decay"]))
+    if device == "cuda" and bool(tcfg.get("fused_optimizer", True)):
+        opt_kwargs["fused"] = True
+    opt = torch.optim.AdamW(model.parameters(), **opt_kwargs)
 
     start_step = 0
     if resume and Path(resume).exists():
