@@ -15,6 +15,7 @@ in-plane symmetries if you ever pre-degrade instead.
 """
 from __future__ import annotations
 
+from pathlib import Path
 from typing import Optional
 
 import numpy as np
@@ -113,14 +114,23 @@ class _BasePatchDataset(Dataset):
         # Overridable; default recomputes robust percentiles per patch.
         return robust_normalize(patch, self.low_pct, self.high_pct)
 
+    # Subclasses that mix scales override this and set it during _sample_clean so
+    # the returned item carries the patch's voxel size for FiLM conditioning.
+    def _last_voxel_um(self) -> float | None:
+        return None
+
     def __getitem__(self, idx: int):
         rng = self._rng(idx)
         clean = self._sample_clean(rng)                # raw patch (any dtype)
         clean = self._normalize(clean)
         if self.augment:
             clean = random_symmetry(clean, rng, self.inplane_only)
+        vum = self._last_voxel_um()
         if self.clean_only:
-            return torch.from_numpy(clean[None]).float()   # (1,z,y,x); degrade on GPU
+            t = torch.from_numpy(clean[None]).float()  # (1,z,y,x); degrade on GPU
+            if vum is not None:
+                return t, torch.tensor(float(vum), dtype=torch.float32)
+            return t
         degraded, params = self.degradation.apply(clean, rng)
         x = torch.from_numpy(degraded[None]).float()   # (1, z, y, x)
         y = torch.from_numpy(clean[None]).float()
@@ -303,6 +313,94 @@ class CachedVolumeDataset(_BasePatchDataset):
             y0 = int(rng.integers(0, sy - py + 1))
             x0 = int(rng.integers(0, sx - px + 1))
             patch = np.asarray(self.volume[z0 : z0 + pz, y0 : y0 + py, x0 : x0 + px])
+            if float((patch > 0).mean()) >= self.occupancy_min:
+                return patch
+        return patch
+
+
+class MultiCubeDataset(_BasePatchDataset):
+    """Sample patches across MANY cached cubes from different scrolls/resolutions
+    (manifest from scripts/cache_multi.py), each tagged with its voxel_um for FiLM
+    scale conditioning. This is the data engine for the generic scale-conditioned
+    restorer -- one model, all resolution tiers contributing.
+
+    Cubes are loaded into RAM (the curated set is a few GB). Each item:
+      1. pick a cube (weighted by occupancy so good regions dominate),
+      2. importance-sample an occupied patch,
+      3. normalize with that cube's precomputed global constants,
+      4. carry the cube's voxel_um out for conditioning.
+    """
+
+    def __init__(
+        self,
+        manifest_path: str,
+        patch=(64, 64, 64),
+        degradation: Optional[RandomDegradation] = None,
+        occupancy_min: float = 0.5,
+        low_pct: float = 0.5,
+        high_pct: float = 99.5,
+        augment: bool = True,
+        inplane_only: bool = False,
+        length: int = 1_000_000,
+        seed: int = 0,
+        max_reject: int = 60,
+        return_params: bool = False,
+    ):
+        import json
+        if degradation is None:
+            degradation = RandomDegradation(DegradationRanges())
+        super().__init__(patch, degradation, low_pct, high_pct, augment,
+                         inplane_only, length, seed, return_params)
+        self.occupancy_min = occupancy_min
+        self.max_reject = max_reject
+        entries = json.loads(Path(manifest_path).read_text())
+        self.cubes = []      # list of dicts: volume(ndarray), voxel_um, norm(lo,hi)
+        for e in entries:
+            vol = np.ascontiguousarray(np.load(e["path"]))
+            sample = vol[::4, ::4, ::4]
+            nz = sample[sample > 0]
+            if nz.size:
+                lo, hi = np.percentile(nz, [low_pct, high_pct])
+                if hi <= lo:
+                    hi = lo + 1.0
+            else:
+                lo, hi = 0.0, 1.0
+            self.cubes.append({"vol": vol, "voxel_um": float(e["voxel_um"]),
+                               "norm": (float(lo), float(hi)),
+                               "occ": float(e.get("occupancy", 0.1))})
+        if not self.cubes:
+            raise RuntimeError(f"no cubes loaded from {manifest_path}")
+        # sampling weights: favor higher-occupancy cubes (more usable signal)
+        w = np.array([c["occ"] for c in self.cubes], dtype=np.float64)
+        self.weights = w / w.sum()
+        self._cur_vum = None
+        self._cur_norm = None
+
+    def _last_voxel_um(self):
+        return self._cur_vum
+
+    def _normalize(self, patch: np.ndarray) -> np.ndarray:
+        lo, hi = self._cur_norm
+        v = patch.astype(np.float32)
+        np.subtract(v, lo, out=v)
+        np.multiply(v, 1.0 / (hi - lo), out=v)
+        np.clip(v, 0.0, 1.0, out=v)
+        return v
+
+    def _sample_clean(self, rng: np.random.Generator) -> np.ndarray:
+        ci = int(rng.choice(len(self.cubes), p=self.weights))
+        cube = self.cubes[ci]
+        self._cur_vum = cube["voxel_um"]
+        self._cur_norm = cube["norm"]
+        vol = cube["vol"]
+        pz, py, px = self.patch
+        sz, sy, sx = vol.shape
+        patch = None
+        for _ in range(self.max_reject):
+            z0 = int(rng.integers(0, sz - pz + 1))
+            y0 = int(rng.integers(0, sy - py + 1))
+            x0 = int(rng.integers(0, sx - px + 1))
+            patch = np.asarray(vol[z0:z0+pz, y0:y0+py, x0:x0+px])
             if float((patch > 0).mean()) >= self.occupancy_min:
                 return patch
         return patch

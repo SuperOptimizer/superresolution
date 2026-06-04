@@ -64,6 +64,14 @@ def build_dataset(cfg: dict, smoke: bool, length: int, return_params: bool = Tru
             occupancy_min=d.get("occupancy_min", 0.5),
             **common,
         )
+    if source == "multicube":
+        from .data import MultiCubeDataset
+        return MultiCubeDataset(
+            d["manifest"],
+            patch=tuple(d["patch"]),
+            occupancy_min=d.get("occupancy_min", 0.5),
+            **common,
+        )
     # real volume (S3 or local) -- per-patch reads
     from .s3zarr import open_s3, open_local
 
@@ -115,45 +123,72 @@ def _s3_sync(local_dir: Path, s3_prefix: str, background: bool = True):
         _s3_sync_blocking(local_dir, s3_prefix)
 
 
-@torch.no_grad()
-def _spectrum_check(model, cfg, device, use_amp) -> dict:
-    """Degrade -> restore one held-out synthetic-or-real patch; report overshoot."""
+def _sample_val_clean(cfg, rng):
+    """Return (clean_patch_normalized, voxel_um or None) for validation.
+
+    Averages over several patches at the call site; this returns one. For the
+    multicube source we draw from a random cube (so validation spans scales).
+    """
     d = cfg["data"]
     patch = tuple(d["patch"])
-    rng = np.random.default_rng(98765)
+    pz, py, px = patch
     src = d.get("source", "synthetic")
-    if src == "cached" and Path(d.get("cache_path", "")).exists():
-        vol = np.load(d["cache_path"], mmap_mode="r")
+    occ_min = d.get("occupancy_min", 0.5)
+
+    def crop_occupied(vol):
         sz, sy, sx = vol.shape
-        pz, py, px = patch
-        # find an occupied patch
-        clean = None
+        c = None
         for _ in range(40):
             z0 = int(rng.integers(0, sz - pz + 1)); y0 = int(rng.integers(0, sy - py + 1)); x0 = int(rng.integers(0, sx - px + 1))
             c = np.asarray(vol[z0:z0+pz, y0:y0+py, x0:x0+px])
-            if (c > 0).mean() >= d.get("occupancy_min", 0.5):
-                clean = c; break
-        if clean is None:
-            clean = c
-        clean = robust_normalize(clean, d.get("norm_low_pct", 0.5), d.get("norm_high_pct", 99.5))
-    else:
-        from .data import make_synthetic_volume
-        clean = robust_normalize(make_synthetic_volume(patch, rng))
+            if (c > 0).mean() >= occ_min:
+                return c
+        return c
+
+    if src == "multicube" and Path(d.get("manifest", "")).exists():
+        import json
+        entries = json.loads(Path(d["manifest"]).read_text())
+        e = entries[int(rng.integers(0, len(entries)))]
+        vol = np.load(e["path"], mmap_mode="r")
+        clean = robust_normalize(crop_occupied(vol), d.get("norm_low_pct", 0.5), d.get("norm_high_pct", 99.5))
+        return clean, float(e["voxel_um"])
+    if src == "cached" and Path(d.get("cache_path", "")).exists():
+        vol = np.load(d["cache_path"], mmap_mode="r")
+        clean = robust_normalize(crop_occupied(vol), d.get("norm_low_pct", 0.5), d.get("norm_high_pct", 99.5))
+        return clean, None
+    from .data import make_synthetic_volume
+    return robust_normalize(make_synthetic_volume(patch, rng)), None
+
+
+@torch.no_grad()
+def _spectrum_check(model, cfg, device, use_amp, n_patches: int = 4) -> dict:
+    """Degrade -> restore several held-out patches; report AVERAGED overshoot/gap.
+
+    Averaging over patches makes the metric stable enough to trust over a long
+    run (single-patch spectrum is ~+-0.04 noisy). Scale-conditioned: passes each
+    patch's voxel_um to the model.
+    """
+    rng = np.random.default_rng(98765)
+    scale_cond = bool(cfg["model"].get("scale_cond", False))
+    eval_model = getattr(model, "_orig_mod", model)  # uncompiled (avoid recompile)
     deg = RandomDegradation(DegradationRanges.from_config(cfg["degradation"]))
-    degraded, _ = deg.apply(clean, rng)
-    x = torch.from_numpy(degraded[None, None]).float().to(device)
-    # Use the UNCOMPILED model for validation: the val batch shape (1) differs from
-    # the training shape, and calling the compiled model would trigger a costly
-    # recompile each validation. The orig module shares weights, so results match.
-    eval_model = getattr(model, "_orig_mod", model)
     ctx = torch.autocast("cuda", dtype=torch.bfloat16) if use_amp else _nullctx()
-    with ctx:
-        pred = eval_model(x)
-    restored = pred[0, 0].float().cpu().numpy()
-    m_in = overshoot_metric(degraded, clean)
-    m_out = overshoot_metric(restored, clean)
-    return {"in_gap": m_in["mean_log_gap"], "out_gap": m_out["mean_log_gap"],
-            "overshoot": m_out["overshoot_ratio"]}
+    in_gaps, out_gaps, overshoots = [], [], []
+    for _ in range(n_patches):
+        clean, vum = _sample_val_clean(cfg, rng)
+        degraded, _ = deg.apply(clean, rng)
+        x = torch.from_numpy(degraded[None, None]).float().to(device)
+        vt = (torch.tensor([float(vum)], device=device)
+              if (scale_cond and vum is not None) else None)
+        with ctx:
+            pred = eval_model(x, voxel_um=vt) if scale_cond else eval_model(x)
+        restored = pred[0, 0].float().cpu().numpy()
+        in_gaps.append(overshoot_metric(degraded, clean)["mean_log_gap"])
+        m_out = overshoot_metric(restored, clean)
+        out_gaps.append(m_out["mean_log_gap"])
+        overshoots.append(m_out["overshoot_ratio"])
+    return {"in_gap": float(np.mean(in_gaps)), "out_gap": float(np.mean(out_gaps)),
+            "overshoot": float(np.mean(overshoots))}
 
 
 def train(config_path: str, smoke: bool = False, max_steps: int | None = None,
@@ -199,6 +234,7 @@ def train(config_path: str, smoke: bool = False, max_steps: int | None = None,
     )
 
     model = build_model(cfg["model"]).to(device)
+    scale_cond = bool(cfg["model"].get("scale_cond", False))
     # NOTE: channels_last_3d measured ~2x SLOWER for these 3D convs on the L4
     # (Ada) -- it selects worse cuDNN kernels. Keep contiguous. Opt in per-config.
     chlast = bool(tcfg.get("channels_last", False)) and device == "cuda"
@@ -270,8 +306,15 @@ def train(config_path: str, smoke: bool = False, max_steps: int | None = None,
     for batch in loader:
         if step >= steps:
             break
+        vum = None
         if gpu_degrade:
-            y = batch.to(device, non_blocking=True)          # clean target
+            # clean-only loader: batch is either clean, or (clean, voxel_um)
+            if isinstance(batch, (list, tuple)):
+                y, vum = batch
+                vum = vum.to(device, non_blocking=True)
+            else:
+                y = batch
+            y = y.to(device, non_blocking=True)
             with torch.no_grad():
                 x, params = gdeg.apply(y, deg_rng)            # degrade on GPU
         else:
@@ -284,7 +327,7 @@ def train(config_path: str, smoke: bool = False, max_steps: int | None = None,
         opt.zero_grad(set_to_none=True)
         ctx = torch.autocast("cuda", dtype=torch.bfloat16) if use_amp else _nullctx()
         with ctx:
-            pred = model(x)
+            pred = model(x, voxel_um=vum) if scale_cond else model(x)
             mask = air_mask(y) if mask_air else None
             loss = charbonnier(pred, y, eps=eps, mask=mask)
             if dc_w > 0:

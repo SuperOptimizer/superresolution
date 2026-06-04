@@ -1,0 +1,74 @@
+# Scale-conditioned multi-scroll restoration on the L4.
+# One model, FiLM-conditioned on voxel size, trained across all resolution tiers
+# (1.129um + ~2.4um) from 11 cached ROIs. Optimized L4 settings (compile, 64^3,
+# bf16, fused opt, in-RAM data, GPU degrade).
+{
+  "seed": 0,
+
+  "data": {
+    "source": "multicube",
+    "manifest": "/mnt/data/cubes/cubes.json",
+    "patch": [64, 64, 64],
+    "occupancy_min": 0.5,
+    "norm_low_pct": 0.5,
+    "norm_high_pct": 99.5,
+    "augment": true,
+    "augment_inplane_only": false
+  },
+
+  "degradation": {
+    "sigma_xy": [0.6, 1.3],
+    "sigma_z":  [0.9, 1.8],
+    "noise_sigma": [0.005, 0.03],
+    "noise_color": [0.0, 1.2],
+    "shift": [-0.5, 0.5],
+    "intensity_gain": [0.9, 1.1],
+    "intensity_bias": [-0.03, 0.03],
+    "u8_quantize": true
+  },
+
+  "model": {
+    "in_ch": 1,
+    "base_width": 32,
+    "levels": 3,
+    "blocks_per_level": 2,
+    "residual": true,
+    "grad_checkpoint": false,
+    "scale_cond": true,
+    "cond_dim": 64
+  },
+
+  "loss": {
+    "charbonnier_eps": 1.0e-3,
+    "mask_air": true,
+    "data_consistency_weight": 0.1
+  },
+
+  "train": {
+    "steps": 10000,
+    "batch_size": 8,
+    "lr": 2.0e-4,
+    "weight_decay": 1.0e-4,
+    "num_workers": 7,
+    "prefetch_factor": 6,
+    "grad_clip": 1.0,
+    "gpu_degrade": true,
+    "fused_optimizer": true,
+    "compile": "max-autotune",
+    "compile_dynamic": false,
+    "compile_fullgraph": true,
+    "log_every": 25,
+    "val_every": 500,
+    "ckpt_every": 500,
+    "ckpt_dir": "/mnt/data/checkpoints/scale_l4",
+    "s3_sync": "s3://YOUR_BUCKET/YOUR_PREFIX/superres/runs/scale_l4",
+    "amp_bf16": true
+  },
+
+  "infer": {
+    "window": [128, 128, 128],
+    "overlap": 16,
+    "occupancy_skip": true,
+    "amp_bf16": true
+  }
+}
