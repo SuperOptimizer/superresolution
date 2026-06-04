@@ -51,3 +51,23 @@ def test_odd_size_handled():
     x = torch.randn(1, 1, 20, 20, 20)
     y = m(x)
     assert y.shape == x.shape
+
+
+def test_scale_conditioning():
+    import torch
+    from superres.model import build_model
+    m = build_model({"base_width": 8, "levels": 2, "scale_cond": True, "cond_dim": 16})
+    x = torch.randn(2, 1, 24, 24, 24)
+    # identity at init (FiLM zero-init + residual)
+    assert torch.allclose(m(x, voxel_um=2.4), x, atol=1e-6)
+    # train a few steps so FiLM is nonzero, then conditioning must change output
+    opt = torch.optim.SGD(m.parameters(), lr=0.1)
+    for _ in range(3):
+        loss = (m(x, voxel_um=2.4) - torch.randn_like(x)).pow(2).mean()
+        loss.backward(); opt.step(); opt.zero_grad()
+    o_fine = m(x, voxel_um=1.13)
+    o_coarse = m(x, voxel_um=7.91)
+    assert not torch.allclose(o_fine, o_coarse, atol=1e-4)
+    # per-sample voxel sizes (mixed-scale batch)
+    vu = torch.tensor([1.13, 2.4])
+    assert m(x, voxel_um=vu).shape == x.shape

@@ -1,0 +1,18 @@
+{
+  "_comment": "Curated training sources from the quality survey (occupancy/contrast/dyn-range all GOOD). Two resolution tiers for scale-conditioned training. voxel_um drives the FiLM scale conditioning.",
+  "bucket": "vesuvius-challenge-open-data",
+  "volumes": [
+    {"scroll": "PHerc0139",  "zarr": "volumes/20260413113053-1.129um-0.2m-59keV-masked.zarr",  "voxel_um": 1.129, "occ": 0.583, "contrast": 38.5},
+    {"scroll": "PHerc0814",  "zarr": "volumes/20260521123630-1.129um-0.2m-59keV-masked.zarr",  "voxel_um": 1.129, "occ": 0.648, "contrast": 33.9},
+    {"scroll": "PHercMANBp", "zarr": "volumes/20260427100434-2.399um-0.2m-78keV-masked.zarr",   "voxel_um": 2.399, "occ": 0.042, "contrast": 25.0},
+    {"scroll": "PHerc0500P2","zarr": "volumes/20250526151718-2.215um-0.4m-111keV-masked.zarr",  "voxel_um": 2.215, "occ": 0.051, "contrast": 28.2},
+    {"scroll": "PHerc1203",  "zarr": "volumes/20260319130212-2.403um-0.2m-77keV-masked.zarr",   "voxel_um": 2.403, "occ": 0.243, "contrast": 28.6},
+    {"scroll": "PHerc0332",  "zarr": "volumes/20251211183505-2.399um-0.2m-78keV-masked.zarr",   "voxel_um": 2.399, "occ": 0.226, "contrast": 27.5},
+    {"scroll": "PHerc0009B", "zarr": "volumes/20250820154339-2.401um-0.3m-77keV-masked.zarr",   "voxel_um": 2.401, "occ": 0.065, "contrast": 39.3},
+    {"scroll": "PHerc0841",  "zarr": "volumes/20260319124803-2.403um-0.2m-77keV-masked.zarr",   "voxel_um": 2.403, "occ": 0.206, "contrast": 25.6},
+    {"scroll": "PHerc0846A", "zarr": "volumes/20260319102732-2.403um-0.2m-77keV-masked.zarr",   "voxel_um": 2.403, "occ": 0.290, "contrast": 28.5},
+    {"scroll": "PHerc1299",  "zarr": "volumes/20260309130042-2.399um-0.2m-78keV-masked.zarr",   "voxel_um": 2.399, "occ": 0.126, "contrast": 23.2},
+    {"scroll": "PHerc1451",  "zarr": "volumes/20260319101107-2.399um-0.2m-78keV-masked.zarr",   "voxel_um": 2.399, "occ": 0.202, "contrast": 30.1},
+    {"scroll": "PHercMAN5",  "zarr": "volumes/20260311104824-2.399um-0.2m-78keV-masked.zarr",   "voxel_um": 2.399, "occ": 0.147, "contrast": 48.5}
+  ]
+}
