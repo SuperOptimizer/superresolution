@@ -1,12 +1,13 @@
 """Physics-derived PSF from BM18 acquisition metadata (Paganin + optics).
 
 The dominant, KNOWN blur in these reconstructions is the Paganin single-distance
-phase-retrieval filter applied during recon. It is an analytic low-pass with a
-transfer function set by delta_beta, X-ray wavelength, and propagation distance:
+phase-retrieval filter applied during recon. It is an analytic low-pass; we use
+the EXACT form from ESRF's nabu (nabu/preproc/phase.py, verified to ~1e-16):
 
-    T(k) = 1 / (1 + (delta_beta) * lambda * z * |k|^2 / (4*pi))
+    T(f) = 1 / (1 + delta_beta * lambda * D * pi * f^2)
 
-A Gaussian unsharp mask (sigma, coeff) is applied afterward to partly re-sharpen.
+with f in cycles/micron, lambda = 1.23984199e-3 / E_keV (micron), D = distance
+(micron). A Gaussian unsharp mask (sigma, coeff) is applied afterward to re-sharpen.
 So the effective recon transfer function is roughly:
 
     H_recon(k) = T_paganin(k) * U_unsharp(k)
@@ -26,6 +27,48 @@ import numpy as np
 
 # Constant from nabu (keV*micron); wavelength_micron = _HC_KEV_UM / energy_keV.
 _HC_KEV_UM = 1.23984199e-3
+
+
+def physics_from_metadata(md: dict) -> dict | None:
+    """Extract the PSF-relevant recon physics from a volume's metadata.json dict.
+
+    Tolerant of schema variation. Returns a physics dict usable by recon_transfer,
+    or None if the essential Paganin params are absent. Mirrors the full nabu chain
+    we can model: Paganin (delta_beta), unsharp (coeff/sigma), acquisition geometry.
+    """
+    if not md:
+        return None
+    tomo = (md.get("scan", {}) or {}).get("tomo", {}) or {}
+    acq = tomo.get("acquisition", {}) or {}
+    proc = tomo.get("processing", {}) or {}
+    pre = proc.get("preprocessing", {}) or {}
+    phase = pre.get("phase", {}) or {}
+    det = acq.get("detector", {}) or {}
+    recon = proc.get("reconstruction", {}) if isinstance(proc.get("reconstruction"), dict) else {}
+
+    def num(x):
+        try:
+            return float(x)
+        except (TypeError, ValueError):
+            return None
+
+    p = {
+        "paganin_delta_beta": num(phase.get("delta_beta")),
+        "unsharp_coeff": num(phase.get("unsharp_coeff")) or 0.0,
+        "unsharp_sigma": num(phase.get("unsharp_sigma")) or 0.0,
+        "unsharp_method": phase.get("unsharp_method", "gaussian"),
+        "energy_kev": num(acq.get("energy")),
+        "sample_detector_mm": num(acq.get("sampleDetectorDistance")),
+        "sample_pixel_mm": num(det.get("samplePixelSize")),
+        "scintillator": det.get("scintillator"),
+        "recon_method": recon.get("method"),
+        "fbp_filter": (recon.get("fbp_filter_type") or "ramlak"),
+    }
+    if p["paganin_delta_beta"] is None or p["energy_kev"] is None:
+        return None
+    # sample_pixel_um for the transfer functions
+    p["sample_pixel_um"] = (p["sample_pixel_mm"] or 0.0024) * 1000.0
+    return p
 
 
 def wavelength_micron(energy_kev: float) -> float:
