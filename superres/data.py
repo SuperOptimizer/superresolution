@@ -109,10 +109,14 @@ class _BasePatchDataset(Dataset):
         # Per-(epoch-agnostic)-item RNG; varies with idx so workers diverge.
         return np.random.default_rng(self.seed * 1_000_003 + idx)
 
+    def _normalize(self, patch: np.ndarray) -> np.ndarray:
+        # Overridable; default recomputes robust percentiles per patch.
+        return robust_normalize(patch, self.low_pct, self.high_pct)
+
     def __getitem__(self, idx: int):
         rng = self._rng(idx)
         clean = self._sample_clean(rng)                # raw patch (any dtype)
-        clean = robust_normalize(clean, self.low_pct, self.high_pct)
+        clean = self._normalize(clean)
         if self.augment:
             clean = random_symmetry(clean, rng, self.inplane_only)
         if self.clean_only:
@@ -228,10 +232,15 @@ class SyntheticPatchDataset(_BasePatchDataset):
 
 
 class CachedVolumeDataset(_BasePatchDataset):
-    """Sample patches from a local cached cube (.npy on fast disk) produced by
-    scripts/cache_roi.py. Memory-maps the file so workers share it without copying.
-    Importance-samples toward occupied (papyrus) regions, same as PatchDataset, but
-    with no per-patch network cost.
+    """Sample patches from a local cached cube (.npy) produced by scripts/cache_roi.py.
+
+    Throughput-critical, so two optimizations over a naive mmap loader:
+      - in_ram=True loads the whole cube into RAM (no per-patch NVMe page faults --
+        the #1 loader cost; a few-GB cube fits easily in host RAM).
+      - precompute_norm computes the robust-normalization constants ONCE over the
+        whole cube, so per-patch normalization is a single multiply instead of a
+        per-patch percentile sort (the #2 loader cost).
+    Importance-samples toward occupied (papyrus) regions, no per-patch network cost.
     """
 
     def __init__(
@@ -248,15 +257,42 @@ class CachedVolumeDataset(_BasePatchDataset):
         seed: int = 0,
         max_reject: int = 50,
         return_params: bool = False,
+        in_ram: bool = True,
+        precompute_norm: bool = True,
     ):
         if degradation is None:
             degradation = RandomDegradation(DegradationRanges())
         super().__init__(patch, degradation, low_pct, high_pct, augment,
                          inplane_only, length, seed, return_params)
-        # mmap so each DataLoader worker maps the same pages (no per-worker copy)
-        self.volume = np.load(npy_path, mmap_mode="r")
+        if in_ram:
+            # Load fully into RAM -- eliminates random-access NVMe page faults.
+            self.volume = np.ascontiguousarray(np.load(npy_path))
+        else:
+            self.volume = np.load(npy_path, mmap_mode="r")
         self.occupancy_min = occupancy_min
         self.max_reject = max_reject
+        # Precompute global normalization constants from a subsample of occupied voxels.
+        self._norm = None
+        if precompute_norm:
+            sample = self.volume[::4, ::4, ::4]
+            nz = sample[sample > 0]
+            if nz.size:
+                lo, hi = np.percentile(nz, [low_pct, high_pct])
+                if hi <= lo:
+                    hi = lo + 1.0
+                self._norm = (float(lo), float(hi))
+
+    def _normalize(self, patch: np.ndarray) -> np.ndarray:
+        # Fast path: apply the precomputed global constants (single multiply),
+        # avoiding a per-patch percentile sort. Falls back to per-patch if absent.
+        if self._norm is None:
+            return robust_normalize(patch, self.low_pct, self.high_pct)
+        lo, hi = self._norm
+        v = patch.astype(np.float32)
+        np.subtract(v, lo, out=v)
+        np.multiply(v, 1.0 / (hi - lo), out=v)
+        np.clip(v, 0.0, 1.0, out=v)
+        return v
 
     def _sample_clean(self, rng: np.random.Generator) -> np.ndarray:
         pz, py, px = self.patch
