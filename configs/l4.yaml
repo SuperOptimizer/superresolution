@@ -13,7 +13,7 @@
     "level": 0,
     "local_path": null,
 
-    "patch": [128, 128, 128],
+    "patch": [96, 96, 96],
     "occupancy_min": 0.5,
     "norm_low_pct": 0.5,
     "norm_high_pct": 99.5,
@@ -37,7 +37,8 @@
     "base_width": 32,
     "levels": 3,
     "blocks_per_level": 2,
-    "residual": true
+    "residual": true,
+    "grad_checkpoint": true
   },
 
   "loss": {
@@ -48,7 +49,7 @@
 
   "train": {
     "steps": 1500,
-    "batch_size": 4,
+    "batch_size": 2,
     "lr": 2.0e-4,
     "weight_decay": 1.0e-4,
     "num_workers": 6,

@@ -80,9 +80,11 @@ class ResUNet3D(nn.Module):
         levels: int = 3,
         blocks_per_level: int = 2,
         residual: bool = True,
+        grad_checkpoint: bool = False,
     ):
         super().__init__()
         self.residual = residual
+        self.grad_checkpoint = grad_checkpoint
         w = base_width
         self.stem = nn.Sequential(
             nn.Conv3d(in_ch, w, 3, padding=1), _gn(w), nn.SiLU(inplace=True),
@@ -103,14 +105,24 @@ class ResUNet3D(nn.Module):
 
     def forward(self, x):
         inp = x
-        h = self.stem(x)
+        ckpt = self.grad_checkpoint and self.training and x.requires_grad
+        if ckpt:
+            from torch.utils.checkpoint import checkpoint
+
+            def run(mod, *a):
+                return checkpoint(mod, *a, use_reentrant=False)
+        else:
+            def run(mod, *a):
+                return mod(*a)
+
+        h = run(self.stem, x)
         skips = [h]
         for d in self.downs:
-            h = d(h)
+            h = run(d, h)
             skips.append(h)
         h = skips[-1]
         for i, u in enumerate(self.ups):
-            h = u(h, skips[-(i + 2)])
+            h = run(u, h, skips[-(i + 2)])
         delta = self.head(h)
         return inp + delta if self.residual else delta
 
@@ -122,6 +134,7 @@ def build_model(cfg: dict) -> ResUNet3D:
         levels=int(cfg.get("levels", 3)),
         blocks_per_level=int(cfg.get("blocks_per_level", 2)),
         residual=bool(cfg.get("residual", True)),
+        grad_checkpoint=bool(cfg.get("grad_checkpoint", False)),
     )
 
 

@@ -11,9 +11,13 @@ validation on a held-out patch, checkpoint + report sync to S3, and resume.
 """
 from __future__ import annotations
 
+import os
 import subprocess
 import time
 from pathlib import Path
+
+# Reduce CUDA fragmentation; must be set before the CUDA context is created.
+os.environ.setdefault("PYTORCH_CUDA_ALLOC_CONF", "expandable_segments:True")
 
 import numpy as np
 import torch
