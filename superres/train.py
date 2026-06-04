@@ -13,6 +13,7 @@ from __future__ import annotations
 
 import os
 import subprocess
+import threading
 import time
 from pathlib import Path
 
@@ -89,18 +90,29 @@ def _collate(batch):
     return xs, ys, merged
 
 
-def _s3_sync(local_dir: Path, s3_prefix: str):
-    """Best-effort upload of a directory to S3 via the AWS CLI (instance role)."""
-    if not s3_prefix:
-        return
+def _s3_sync_blocking(local_dir: Path, s3_prefix: str):
     try:
         subprocess.run(
             ["aws", "s3", "sync", str(local_dir), s3_prefix, "--only-show-errors"],
             check=False, timeout=600,
         )
-        print(f"  [s3] synced {local_dir} -> {s3_prefix}")
+        print(f"  [s3] synced {local_dir} -> {s3_prefix}", flush=True)
     except Exception as e:  # never let a sync failure kill training
-        print(f"  [s3] sync failed: {e}")
+        print(f"  [s3] sync failed: {e}", flush=True)
+
+
+def _s3_sync(local_dir: Path, s3_prefix: str, background: bool = True):
+    """Upload a directory to S3. Backgrounded by default so the (network-bound)
+    upload never blocks the training loop -- the checkpoint is already on local
+    disk, so we don't need to wait for it to reach S3 to keep training."""
+    if not s3_prefix:
+        return
+    if background:
+        t = threading.Thread(target=_s3_sync_blocking, args=(local_dir, s3_prefix),
+                             daemon=True)
+        t.start()
+    else:
+        _s3_sync_blocking(local_dir, s3_prefix)
 
 
 @torch.no_grad()
@@ -222,10 +234,18 @@ def train(config_path: str, smoke: bool = False, max_steps: int | None = None,
     val_every = max(1, int(tcfg.get("val_every", 1000)))
     ckpt_every = int(tcfg.get("ckpt_every", 2000))
 
-    def save(step, tag="latest"):
+    def save(step, tag="latest", background=True):
         path = ckpt_dir / f"{tag}.pt"
-        torch.save({"model": model.state_dict(), "opt": opt.state_dict(),
-                    "cfg": cfg, "step": step}, path)
+        # Snapshot to CPU on the main thread (cheap, must read live GPU state),
+        # then write to disk in a thread so the (I/O-bound) save doesn't stall
+        # training. torch.compile wraps the model -- unwrap for a clean state_dict.
+        m = getattr(model, "_orig_mod", model)
+        snap = {"model": {k: v.detach().to("cpu", copy=True) for k, v in m.state_dict().items()},
+                "opt": opt.state_dict(), "cfg": cfg, "step": step}
+        if background:
+            threading.Thread(target=torch.save, args=(snap, path), daemon=True).start()
+        else:
+            torch.save(snap, path)
         return path
 
     deg_rng = np.random.default_rng(cfg.get("seed", 0) + 777)
@@ -260,10 +280,12 @@ def train(config_path: str, smoke: bool = False, max_steps: int | None = None,
         if grad_clip > 0:
             torch.nn.utils.clip_grad_norm_(model.parameters(), grad_clip)
         opt.step()
-        last_loss = float(loss.detach().cpu())
         seen += 1
 
+        # Only sync the loss to CPU on log steps -- doing it every step forces a
+        # GPU->CPU stall that serializes the async pipeline.
         if step % log_every == 0:
+            last_loss = float(loss.detach().cpu())
             dt = time.time() - t_win
             ips = seen / dt if dt > 0 else 0.0
             print(f"step {step:6d}  loss {last_loss:.5f}  {ips:.2f} it/s  "
@@ -276,15 +298,18 @@ def train(config_path: str, smoke: bool = False, max_steps: int | None = None,
             model.train()
             print(f"  [val] spectrum gap in={s['in_gap']:.3f} -> out={s['out_gap']:.3f}  "
                   f"overshoot={s['overshoot']:.2f}  (want out<in, overshoot<~1.1)", flush=True)
+            t_win = time.time(); seen = 0   # don't count the val pause against throughput
 
         if (step + 1) % ckpt_every == 0:
-            p = save(step)
+            p = save(step)                  # CPU snapshot + threaded write (non-blocking)
             print(f"  [ckpt] step {step} -> {p}", flush=True)
-            _s3_sync(ckpt_dir, s3_prefix)
+            _s3_sync(ckpt_dir, s3_prefix)   # backgrounded upload
+            t_win = time.time(); seen = 0
         step += 1
 
-    save(step)
-    _s3_sync(ckpt_dir, s3_prefix)
+    last_loss = float(loss.detach().cpu())
+    save(step, background=False)            # final save must complete
+    _s3_sync(ckpt_dir, s3_prefix, background=False)
     print(f"done. final loss {last_loss}. checkpoint -> {ckpt_dir/'latest.pt'}")
     return last_loss
 
