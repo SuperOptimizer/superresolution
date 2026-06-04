@@ -49,13 +49,16 @@
 
   "train": {
     "steps": 1500,
-    "batch_size": 2,
+    "batch_size": 4,
     "lr": 2.0e-4,
     "weight_decay": 1.0e-4,
     "num_workers": 6,
     "prefetch_factor": 4,
     "grad_clip": 1.0,
     "gpu_degrade": true,
+    "compile": "max-autotune",
+    "compile_dynamic": false,
+    "compile_fullgraph": true,
     "log_every": 25,
     "val_every": 250,
     "ckpt_every": 250,

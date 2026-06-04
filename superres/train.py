@@ -182,8 +182,22 @@ def train(config_path: str, smoke: bool = False, max_steps: int | None = None,
     chlast = bool(tcfg.get("channels_last", False)) and device == "cuda"
     if chlast:
         model = model.to(memory_format=torch.channels_last_3d)
-    print(f"model params: {count_params(model):,}  device: {device}  bf16={use_amp}  "
-          f"source={cfg['data'].get('source')}")
+    n_params = count_params(model)
+    # torch.compile: fuse the many small 3D-conv kernels (better SM occupancy) and,
+    # with mode="reduce-overhead", capture CUDA graphs to remove per-step dispatch
+    # gaps -- both push us toward compute saturation. Gated by train.compile.
+    compile_mode = tcfg.get("compile", None)
+    if compile_mode and device == "cuda":
+        # static shapes (patches are fixed-size) + fullgraph (no silent eager
+        # fallback) let Inductor specialize hardest. Both default on when compiling.
+        c_dynamic = bool(tcfg.get("compile_dynamic", False))
+        c_fullgraph = bool(tcfg.get("compile_fullgraph", True))
+        print(f"torch.compile(mode={compile_mode!r}, dynamic={c_dynamic}, "
+              f"fullgraph={c_fullgraph}) -- first steps slow (autotune)")
+        model = torch.compile(model, mode=compile_mode,
+                              dynamic=c_dynamic, fullgraph=c_fullgraph)
+    print(f"model params: {n_params:,}  device: {device}  bf16={use_amp}  "
+          f"compile={compile_mode}  source={cfg['data'].get('source')}")
     opt = torch.optim.AdamW(
         model.parameters(), lr=float(tcfg["lr"]), weight_decay=float(tcfg["weight_decay"])
     )
