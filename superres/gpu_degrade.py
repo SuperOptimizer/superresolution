@@ -52,7 +52,7 @@ class GPUDegradation:
         return float(rng.uniform(lo_hi[0], lo_hi[1]))
 
     def apply(self, clean: torch.Tensor, rng: np.random.Generator, voxel_um=None,
-              ref_um: float = 2.4):
+              ref_um: float = 2.4, max_scale: float = 1.5):
         """Return (degraded, params). Operates per-sample so each gets its own draw.
 
         Because separable conv with a per-sample kernel isn't a single batched op,
@@ -73,7 +73,11 @@ class GPUDegradation:
         sig_z, sig_xy = [], []
         for i in range(n):
             v = clean[i : i + 1]
+            # per-scale PSF, but CAPPED: 2.13x extra blur on the fine tier crushed
+            # the signal to ~0.11 Nyquist (over-degraded). Cap keeps it physical
+            # without obliterating the recoverable band.
             scale = (ref_um / float(voxel_um[i])) if voxel_um is not None else 1.0
+            scale = min(scale, max_scale)
             sz = self._u(self.r.sigma_z, rng) * scale
             sxy = self._u(self.r.sigma_xy, rng) * scale
             gain = self._u(self.r.intensity_gain, rng)
