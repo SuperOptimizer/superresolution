@@ -38,3 +38,19 @@ def test_overshoot_metric_low_for_matching_volume():
     m = overshoot_metric(target.copy(), target)
     assert m["overshoot_ratio"] < 1.01
     assert m["mean_log_gap"] < 1e-6
+
+
+def test_quality_metrics():
+    from superres.spectrum import psnr, ssim, hf_psnr, quality_metrics
+    from superres.degradation import anisotropic_blur
+    rng = np.random.default_rng(0)
+    clean = rng.random((24, 24, 24)).astype("float32")
+    assert psnr(clean, clean) >= 99.0          # identical -> max
+    assert abs(ssim(clean, clean) - 1.0) < 1e-6
+    degraded = anisotropic_blur(clean, 1.5, 1.0)
+    restored = 0.5 * clean + 0.5 * degraded     # partial restoration
+    qm = quality_metrics(restored, clean, degraded=degraded)
+    # restoring toward clean must improve fidelity over the degraded input
+    assert qm["psnr_gain"] > 0
+    assert qm["hf_psnr_gain"] > 0               # gain specifically in the HF band
+    assert 0 <= qm["ssim"] <= 1

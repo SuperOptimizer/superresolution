@@ -173,7 +173,9 @@ def _spectrum_check(model, cfg, device, use_amp, n_patches: int = 4) -> dict:
     eval_model = getattr(model, "_orig_mod", model)  # uncompiled (avoid recompile)
     deg = RandomDegradation(DegradationRanges.from_config(cfg["degradation"]))
     ctx = torch.autocast("cuda", dtype=torch.bfloat16) if use_amp else _nullctx()
+    from .spectrum import quality_metrics
     in_gaps, out_gaps, overshoots = [], [], []
+    psnrs, ssims, hf_gains = [], [], []
     for _ in range(n_patches):
         clean, vum = _sample_val_clean(cfg, rng)
         degraded, _ = deg.apply(clean, rng)
@@ -187,8 +189,11 @@ def _spectrum_check(model, cfg, device, use_amp, n_patches: int = 4) -> dict:
         m_out = overshoot_metric(restored, clean)
         out_gaps.append(m_out["mean_log_gap"])
         overshoots.append(m_out["overshoot_ratio"])
+        qm = quality_metrics(restored, clean, degraded=degraded)
+        psnrs.append(qm["psnr"]); ssims.append(qm["ssim"]); hf_gains.append(qm["hf_psnr_gain"])
     return {"in_gap": float(np.mean(in_gaps)), "out_gap": float(np.mean(out_gaps)),
-            "overshoot": float(np.mean(overshoots))}
+            "overshoot": float(np.mean(overshoots)), "psnr": float(np.mean(psnrs)),
+            "ssim": float(np.mean(ssims)), "hf_psnr_gain": float(np.mean(hf_gains))}
 
 
 def train(config_path: str, smoke: bool = False, max_steps: int | None = None,
@@ -374,8 +379,9 @@ def train(config_path: str, smoke: bool = False, max_steps: int | None = None,
             model.eval()
             s = _spectrum_check(model, cfg, device, use_amp)
             model.train()
-            print(f"  [val] spectrum gap in={s['in_gap']:.3f} -> out={s['out_gap']:.3f}  "
-                  f"overshoot={s['overshoot']:.2f}  (want out<in, overshoot<~1.1)", flush=True)
+            print(f"  [val] gap {s['in_gap']:.3f}->{s['out_gap']:.3f}  "
+                  f"overshoot={s['overshoot']:.2f}  PSNR={s['psnr']:.1f}dB  "
+                  f"SSIM={s['ssim']:.3f}  HFgain={s['hf_psnr_gain']:+.2f}dB", flush=True)
             t_win = time.time(); seen = 0   # don't count the val pause against throughput
 
         if (step + 1) % ckpt_every == 0:

@@ -11,6 +11,68 @@ from __future__ import annotations
 import numpy as np
 
 
+def psnr(pred: np.ndarray, target: np.ndarray, data_range: float = 1.0) -> float:
+    """Peak signal-to-noise ratio (dB). Standard restoration fidelity metric.
+
+    NOTE for this task: PSNR is dominated by low frequencies (which were never
+    degraded), so it's INSENSITIVE to the high-freq band we actually recover. Use
+    alongside hf_psnr / spectral gap, not alone."""
+    mse = float(np.mean((pred.astype(np.float64) - target.astype(np.float64)) ** 2))
+    if mse <= 1e-12:
+        return 99.0
+    return 10.0 * np.log10(data_range * data_range / mse)
+
+
+def ssim(pred: np.ndarray, target: np.ndarray, data_range: float = 1.0) -> float:
+    """Global SSIM (single-window over the whole patch -- cheap, no sliding window).
+
+    Captures luminance/contrast/structure agreement. CAVEAT: SSIM can REWARD
+    invented-but-plausible texture, so it cannot distinguish real recovery from
+    hallucination -- pair it with overshoot_ratio."""
+    a = pred.astype(np.float64); b = target.astype(np.float64)
+    mu_a, mu_b = a.mean(), b.mean()
+    va, vb = a.var(), b.var()
+    cov = ((a - mu_a) * (b - mu_b)).mean()
+    c1 = (0.01 * data_range) ** 2
+    c2 = (0.03 * data_range) ** 2
+    return float(((2 * mu_a * mu_b + c1) * (2 * cov + c2)) /
+                 ((mu_a ** 2 + mu_b ** 2 + c1) * (va + vb + c2)))
+
+
+def hf_psnr(pred: np.ndarray, target: np.ndarray, cutoff: float = 0.25,
+            data_range: float = 1.0) -> float:
+    """PSNR computed ONLY on the high-frequency band (freq > cutoff cyc/voxel).
+
+    This is the sharpest measure of real restoration GAIN: it strips the low-freq
+    bulk that masks improvement in plain PSNR and reports fidelity exactly in the
+    band we restore. High-pass both volumes via FFT, then PSNR on the residual."""
+    def highpass(v):
+        v = v.astype(np.float64)
+        F = np.fft.fftn(v)
+        coords = [np.fft.fftfreq(n) for n in v.shape]
+        grids = np.meshgrid(*coords, indexing="ij")
+        kr = np.sqrt(sum(g ** 2 for g in grids))
+        F[kr < cutoff] = 0.0
+        return np.fft.ifftn(F).real
+    return psnr(highpass(pred), highpass(target), data_range=data_range)
+
+
+def quality_metrics(pred: np.ndarray, target: np.ndarray, degraded: np.ndarray | None = None,
+                    data_range: float = 1.0) -> dict:
+    """Bundle of restoration metrics. If `degraded` (the input) is given, also
+    reports the GAIN over doing nothing (restored vs degraded)."""
+    out = {
+        "psnr": psnr(pred, target, data_range),
+        "ssim": ssim(pred, target, data_range),
+        "hf_psnr": hf_psnr(pred, target, data_range=data_range),
+    }
+    if degraded is not None:
+        out["psnr_gain"] = out["psnr"] - psnr(degraded, target, data_range)
+        out["hf_psnr_gain"] = out["hf_psnr"] - hf_psnr(degraded, target, data_range=data_range)
+        out["ssim_gain"] = out["ssim"] - ssim(degraded, target, data_range)
+    return out
+
+
 def radial_power_spectrum(vol: np.ndarray, nbins: int = 64) -> tuple[np.ndarray, np.ndarray]:
     """Radially-averaged 3-D power spectrum.
 
