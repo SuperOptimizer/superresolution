@@ -139,11 +139,21 @@ class RandomDegradation:
         }
 
     def apply(
-        self, clean: np.ndarray, rng: np.random.Generator, params: dict | None = None
+        self, clean: np.ndarray, rng: np.random.Generator, params: dict | None = None,
+        voxel_um: float | None = None, ref_um: float = 2.4,
     ) -> tuple[np.ndarray, dict]:
-        """Return (degraded, params). `clean` is float (z,y,x), nominally [0,1]."""
+        """Return (degraded, params). `clean` is float (z,y,x), nominally [0,1].
+
+        If `voxel_um` is given, the PSF sigmas are scaled by (ref_um/voxel_um) so
+        the blur is physically consistent across resolution tiers (a fixed-micron
+        PSF spans more voxels at finer resolution). Matches gpu_degrade.GPUDegradation.
+        """
         if params is None:
             params = self.sample_params(rng)
+            if voxel_um is not None:
+                s = ref_um / float(voxel_um)
+                params = {**params, "sigma_z": params["sigma_z"] * s,
+                          "sigma_xy": params["sigma_xy"] * s}
         v = clean.astype(np.float32)
         # intensity jitter (per-scan normalization differences)
         v = v * params["gain"] + params["bias"]

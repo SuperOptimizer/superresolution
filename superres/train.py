@@ -179,7 +179,7 @@ def _spectrum_check(model, cfg, device, use_amp, n_patches: int = 4) -> dict:
     eff_befores, eff_afters, factors = [], [], []
     for _ in range(n_patches):
         clean, vum = _sample_val_clean(cfg, rng)
-        degraded, _ = deg.apply(clean, rng)
+        degraded, _ = deg.apply(clean, rng, voxel_um=(vum if scale_cond else None))
         x = torch.from_numpy(degraded[None, None]).float().to(device)
         vt = (torch.tensor([float(vum)], device=device)
               if (scale_cond and vum is not None) else None)
@@ -348,7 +348,9 @@ def train(config_path: str, smoke: bool = False, max_steps: int | None = None,
                 y = batch
             y = y.to(device, non_blocking=True)
             with torch.no_grad():
-                x, params = gdeg.apply(y, deg_rng)            # degrade on GPU
+                # per-scale PSF: pass voxel_um so each tier is degraded with a
+                # physically-consistent (microns-anchored) blur
+                x, params = gdeg.apply(y, deg_rng, voxel_um=vum)  # degrade on GPU
         else:
             x, y, params = batch
             x = x.to(device, non_blocking=True)

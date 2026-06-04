@@ -51,20 +51,31 @@ class GPUDegradation:
     def _u(self, lo_hi, rng):
         return float(rng.uniform(lo_hi[0], lo_hi[1]))
 
-    def apply(self, clean: torch.Tensor, rng: np.random.Generator):
+    def apply(self, clean: torch.Tensor, rng: np.random.Generator, voxel_um=None,
+              ref_um: float = 2.4):
         """Return (degraded, params). Operates per-sample so each gets its own draw.
 
         Because separable conv with a per-sample kernel isn't a single batched op,
         we loop over the (small) batch -- still vastly cheaper than CPU scipy and
         fully on-device.
+
+        PER-SCALE PSF: the physical PSF (microns) is ~constant for a scanner, but
+        sigma is in VOXELS, so finer scans have MORE voxel-blur (a 2um PSF is ~1.8
+        voxels at 1.129um but ~0.8 voxels at 2.4um). If `voxel_um` is given, we
+        scale the sampled voxel-sigma by (ref_um / voxel_um) so each tier is
+        degraded with a physically-consistent blur. Without this, the finest tier
+        is under-degraded and the model over-sharpens it.
         """
         n = clean.shape[0]
+        if voxel_um is not None and torch.is_tensor(voxel_um):
+            voxel_um = voxel_um.reshape(-1).tolist()
         outs = []
         sig_z, sig_xy = [], []
         for i in range(n):
             v = clean[i : i + 1]
-            sz = self._u(self.r.sigma_z, rng)
-            sxy = self._u(self.r.sigma_xy, rng)
+            scale = (ref_um / float(voxel_um[i])) if voxel_um is not None else 1.0
+            sz = self._u(self.r.sigma_z, rng) * scale
+            sxy = self._u(self.r.sigma_xy, rng) * scale
             gain = self._u(self.r.intensity_gain, rng)
             bias = self._u(self.r.intensity_bias, rng)
             nz = self._u(self.r.noise_sigma, rng)
