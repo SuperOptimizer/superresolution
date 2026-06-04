@@ -177,7 +177,10 @@ def train(config_path: str, smoke: bool = False, max_steps: int | None = None,
     )
 
     model = build_model(cfg["model"]).to(device)
-    if device == "cuda":
+    # NOTE: channels_last_3d measured ~2x SLOWER for these 3D convs on the L4
+    # (Ada) -- it selects worse cuDNN kernels. Keep contiguous. Opt in per-config.
+    chlast = bool(tcfg.get("channels_last", False)) and device == "cuda"
+    if chlast:
         model = model.to(memory_format=torch.channels_last_3d)
     print(f"model params: {count_params(model):,}  device: {device}  bf16={use_amp}  "
           f"source={cfg['data'].get('source')}")
@@ -228,7 +231,7 @@ def train(config_path: str, smoke: bool = False, max_steps: int | None = None,
             x, y, params = batch
             x = x.to(device, non_blocking=True)
             y = y.to(device, non_blocking=True)
-        if device == "cuda":
+        if chlast:
             x = x.to(memory_format=torch.channels_last_3d)
             y = y.to(memory_format=torch.channels_last_3d)
         opt.zero_grad(set_to_none=True)

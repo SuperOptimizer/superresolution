@@ -38,7 +38,7 @@
     "levels": 3,
     "blocks_per_level": 2,
     "residual": true,
-    "grad_checkpoint": true
+    "grad_checkpoint": false
   },
 
   "loss": {
