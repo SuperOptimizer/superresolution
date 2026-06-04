@@ -263,6 +263,24 @@ def train(config_path: str, smoke: bool = False, max_steps: int | None = None,
         opt_kwargs["fused"] = True
     opt = torch.optim.AdamW(model.parameters(), **opt_kwargs)
 
+    # LR schedule: linear warmup then cosine decay to lr_min. A flat LR doesn't
+    # settle over a long convergence run; cosine decay is what lets the loss
+    # actually flatten rather than bounce. Enabled by train.lr_schedule="cosine".
+    import math as _math
+    sched_kind = tcfg.get("lr_schedule", "cosine")
+    warmup = int(tcfg.get("warmup_steps", min(500, int(tcfg["steps"]) // 20)))
+    lr_min_frac = float(tcfg.get("lr_min_frac", 0.05))
+    total_steps = int(tcfg["steps"])
+
+    def lr_factor(s):
+        if sched_kind != "cosine":
+            return 1.0
+        if s < warmup:
+            return (s + 1) / max(1, warmup)
+        prog = (s - warmup) / max(1, total_steps - warmup)
+        prog = min(1.0, prog)
+        return lr_min_frac + (1 - lr_min_frac) * 0.5 * (1 + _math.cos(_math.pi * prog))
+
     start_step = 0
     if resume and Path(resume).exists():
         ck = torch.load(resume, map_location=device, weights_only=False)
@@ -306,6 +324,10 @@ def train(config_path: str, smoke: bool = False, max_steps: int | None = None,
     for batch in loader:
         if step >= steps:
             break
+        # apply LR schedule for this step
+        lr_now = float(tcfg["lr"]) * lr_factor(step)
+        for pg in opt.param_groups:
+            pg["lr"] = lr_now
         vum = None
         if gpu_degrade:
             # clean-only loader: batch is either clean, or (clean, voxel_um)
