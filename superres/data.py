@@ -370,9 +370,23 @@ class MultiCubeDataset(_BasePatchDataset):
                                "occ": float(e.get("occupancy", 0.1))})
         if not self.cubes:
             raise RuntimeError(f"no cubes loaded from {manifest_path}")
-        # sampling weights: favor higher-occupancy cubes (more usable signal)
-        w = np.array([c["occ"] for c in self.cubes], dtype=np.float64)
+        # Sampling weights: BALANCE PER RESOLUTION TIER so an under-represented tier
+        # (e.g. 2 fine cubes vs 9 coarse) still gets equal patch share -- otherwise
+        # the rare tier under-trains and over-sharpens. Each tier gets equal total
+        # probability, split within-tier by occupancy. (Design: "equal patches per
+        # scale, not per available voxel.")
+        tiers = {}
+        for i, c in enumerate(self.cubes):
+            tiers.setdefault(round(c["voxel_um"], 3), []).append(i)
+        w = np.zeros(len(self.cubes), dtype=np.float64)
+        per_tier = 1.0 / len(tiers)
+        for idxs in tiers.values():
+            occ = np.array([self.cubes[i]["occ"] for i in idxs], dtype=np.float64)
+            occ = occ / occ.sum()
+            for j, i in enumerate(idxs):
+                w[i] = per_tier * occ[j]
         self.weights = w / w.sum()
+        self.n_tiers = len(tiers)
         self._cur_vum = None
         self._cur_norm = None
 
