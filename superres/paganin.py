@@ -101,6 +101,30 @@ def apply_recon_blur(vol: np.ndarray, phys: dict, strength: float = 1.0) -> np.n
     return out.astype(np.float32)
 
 
+def deconvolve_recon_torch(vol, phys: dict, reg: float = 0.05):
+    """GPU/torch version of deconvolve_recon for use in the training step.
+
+    `vol` is (N,1,Z,Y,X). Returns the Wiener-deconvolved tensor, same shape.
+    The transfer function H is built on-device from the (per-sample-constant)
+    physics. Runs in fp32 internally for FFT stability, casts back to vol.dtype.
+    """
+    import torch
+    dev = vol.device
+    Z, Y, X = vol.shape[-3:]
+    # radial freq grid in cycles/voxel
+    kz = torch.fft.fftfreq(Z, device=dev)
+    ky = torch.fft.fftfreq(Y, device=dev)
+    kx = torch.fft.fftfreq(X, device=dev)
+    KZ, KY, KX = torch.meshgrid(kz, ky, kx, indexing="ij")
+    kr = torch.sqrt(KZ**2 + KY**2 + KX**2).cpu().numpy()
+    H = recon_transfer(kr, phys)                       # numpy, small cost
+    Ht = torch.from_numpy(H).to(dev, torch.float32)
+    inv = (Ht / (Ht * Ht + reg))[None, None]
+    F = torch.fft.fftn(vol.float(), dim=(-3, -2, -1))
+    out = torch.fft.ifftn(F * inv, dim=(-3, -2, -1)).real
+    return out.to(vol.dtype)
+
+
 def deconvolve_recon(vol: np.ndarray, phys: dict, reg: float = 0.02) -> np.ndarray:
     """Direct (Wiener-regularized) inverse of the recon transfer -- FREE resolution
     recovery with NO learned prior, since it inverts a KNOWN analytic operator.

@@ -282,6 +282,11 @@ def train(config_path: str, smoke: bool = False, max_steps: int | None = None,
     lr_min_frac = float(tcfg.get("lr_min_frac", 0.05))
     total_steps = int(tcfg["steps"])
 
+    # Deconv-preprocessing: if configured, invert the known Paganin operator on the
+    # degraded input before the model. The physics dict comes from cfg["physics"].
+    deconv_phys = cfg.get("physics") if tcfg.get("deconv_input", False) else None
+    deconv_reg = float(tcfg.get("deconv_reg", 0.05))
+
     def lr_factor(s):
         if sched_kind != "cosine":
             return 1.0
@@ -351,6 +356,12 @@ def train(config_path: str, smoke: bool = False, max_steps: int | None = None,
                 # per-scale PSF: pass voxel_um so each tier is degraded with a
                 # physically-consistent (microns-anchored) blur
                 x, params = gdeg.apply(y, deg_rng, voxel_um=vum)  # degrade on GPU
+                if deconv_phys is not None:
+                    # deconv preprocessing: invert the KNOWN Paganin operator so the
+                    # model only learns the noise-limited residual (deconv does the
+                    # free, hallucination-proof part).
+                    from .paganin import deconvolve_recon_torch
+                    x = deconvolve_recon_torch(x, deconv_phys, reg=deconv_reg)
         else:
             x, y, params = batch
             x = x.to(device, non_blocking=True)
