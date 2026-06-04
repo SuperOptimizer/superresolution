@@ -142,9 +142,13 @@ def _spectrum_check(model, cfg, device, use_amp) -> dict:
     deg = RandomDegradation(DegradationRanges.from_config(cfg["degradation"]))
     degraded, _ = deg.apply(clean, rng)
     x = torch.from_numpy(degraded[None, None]).float().to(device)
+    # Use the UNCOMPILED model for validation: the val batch shape (1) differs from
+    # the training shape, and calling the compiled model would trigger a costly
+    # recompile each validation. The orig module shares weights, so results match.
+    eval_model = getattr(model, "_orig_mod", model)
     ctx = torch.autocast("cuda", dtype=torch.bfloat16) if use_amp else _nullctx()
     with ctx:
-        pred = model(x)
+        pred = eval_model(x)
     restored = pred[0, 0].float().cpu().numpy()
     m_in = overshoot_metric(degraded, clean)
     m_out = overshoot_metric(restored, clean)
