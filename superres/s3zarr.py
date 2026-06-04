@@ -17,6 +17,7 @@ from __future__ import annotations
 
 import json
 import subprocess
+import threading
 from collections import OrderedDict
 from pathlib import Path
 from typing import Optional
@@ -132,6 +133,7 @@ class Zarr3D:
         self._chunk_elems = int(np.prod(self.chunks))
         self._cache: "OrderedDict[tuple, np.ndarray]" = OrderedDict()
         self._cache_cap = cache_chunks
+        self._lock = threading.Lock()
 
     # -- chunk access -------------------------------------------------------
     def _chunk_key(self, cz: int, cy: int, cx: int) -> str:
@@ -142,13 +144,18 @@ class Zarr3D:
         return np.full(self.chunks, self.fill_value, dtype=self.dtype)
 
     def get_chunk(self, cz: int, cy: int, cx: int) -> np.ndarray:
-        """Return a full chunk (chunk-shaped). Missing -> fill_value block."""
+        """Return a full chunk (chunk-shaped). Missing -> fill_value block.
+
+        Thread-safe: the cache dict ops are locked; the (slow) network fetch runs
+        outside the lock so concurrent fetches actually parallelize.
+        """
         key = (cz, cy, cx)
-        cached = self._cache.get(key)
-        if cached is not None:
-            self._cache.move_to_end(key)
-            return cached
-        raw = self.backend.get(self._chunk_key(cz, cy, cx))
+        with self._lock:
+            cached = self._cache.get(key)
+            if cached is not None:
+                self._cache.move_to_end(key)
+                return cached
+        raw = self.backend.get(self._chunk_key(cz, cy, cx))  # outside lock
         if raw is None:
             arr = self._fill_chunk()
         else:
@@ -158,10 +165,11 @@ class Zarr3D:
                     f"chunk {key}: got {buf.size} elems, expected {self._chunk_elems}"
                 )
             arr = buf.reshape(self.chunks).copy()
-        self._cache[key] = arr
-        self._cache.move_to_end(key)
-        while len(self._cache) > self._cache_cap:
-            self._cache.popitem(last=False)
+        with self._lock:
+            self._cache[key] = arr
+            self._cache.move_to_end(key)
+            while len(self._cache) > self._cache_cap:
+                self._cache.popitem(last=False)
         return arr
 
     def chunk_occupied(self, cz: int, cy: int, cx: int) -> bool:
@@ -177,10 +185,13 @@ class Zarr3D:
         return np.frombuffer(raw, dtype=self.dtype).any()
 
     # -- region access ------------------------------------------------------
-    def read_region(self, z0: int, y0: int, x0: int, dz: int, dy: int, dx: int) -> np.ndarray:
+    def read_region(self, z0: int, y0: int, x0: int, dz: int, dy: int, dx: int,
+                    workers: int = 16) -> np.ndarray:
         """Read an arbitrary box [z0:z0+dz, ...], assembling from chunks.
 
         The box must lie within bounds. Returns an array of shape (dz, dy, dx).
+        Chunk fetches are I/O-bound (subprocess/network) so we parallelize them
+        across a thread pool (`workers`); set workers<=1 for serial.
         """
         for o, d, s in zip((z0, y0, x0), (dz, dy, dx), self.shape):
             if o < 0 or o + d > s:
@@ -190,6 +201,26 @@ class Zarr3D:
         cz1 = (z0 + dz - 1) // self.chunks[0]
         cy1 = (y0 + dy - 1) // self.chunks[1]
         cx1 = (x0 + dx - 1) // self.chunks[2]
+        coords = [(cz, cy, cx)
+                  for cz in range(cz0, cz1 + 1)
+                  for cy in range(cy0, cy1 + 1)
+                  for cx in range(cx0, cx1 + 1)]
+
+        def place(cell):
+            cz, cy, cx = cell
+            chunk = self.get_chunk(cz, cy, cx)
+            gz, gy, gx = cz * self.chunks[0], cy * self.chunks[1], cx * self.chunks[2]
+            sz0, sz1 = max(z0, gz), min(z0 + dz, gz + self.chunks[0])
+            sy0, sy1 = max(y0, gy), min(y0 + dy, gy + self.chunks[1])
+            sx0, sx1 = max(x0, gx), min(x0 + dx, gx + self.chunks[2])
+            out[sz0 - z0 : sz1 - z0, sy0 - y0 : sy1 - y0, sx0 - x0 : sx1 - x0] = chunk[
+                sz0 - gz : sz1 - gz, sy0 - gy : sy1 - gy, sx0 - gx : sx1 - gx]
+
+        if workers and workers > 1 and len(coords) > 1:
+            from concurrent.futures import ThreadPoolExecutor
+            with ThreadPoolExecutor(max_workers=workers) as ex:
+                list(ex.map(place, coords))
+            return out
         for cz in range(cz0, cz1 + 1):
             for cy in range(cy0, cy1 + 1):
                 for cx in range(cx0, cx1 + 1):
