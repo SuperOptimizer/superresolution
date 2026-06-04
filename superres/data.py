@@ -220,3 +220,48 @@ class SyntheticPatchDataset(_BasePatchDataset):
         y0 = int(rng.integers(0, sy - py + 1))
         x0 = int(rng.integers(0, sx - px + 1))
         return self.volume[z0 : z0 + pz, y0 : y0 + py, x0 : x0 + px]
+
+
+class CachedVolumeDataset(_BasePatchDataset):
+    """Sample patches from a local cached cube (.npy on fast disk) produced by
+    scripts/cache_roi.py. Memory-maps the file so workers share it without copying.
+    Importance-samples toward occupied (papyrus) regions, same as PatchDataset, but
+    with no per-patch network cost.
+    """
+
+    def __init__(
+        self,
+        npy_path: str,
+        patch=(128, 128, 128),
+        degradation: Optional[RandomDegradation] = None,
+        occupancy_min: float = 0.5,
+        low_pct: float = 0.5,
+        high_pct: float = 99.5,
+        augment: bool = True,
+        inplane_only: bool = False,
+        length: int = 100_000,
+        seed: int = 0,
+        max_reject: int = 50,
+        return_params: bool = False,
+    ):
+        if degradation is None:
+            degradation = RandomDegradation(DegradationRanges())
+        super().__init__(patch, degradation, low_pct, high_pct, augment,
+                         inplane_only, length, seed, return_params)
+        # mmap so each DataLoader worker maps the same pages (no per-worker copy)
+        self.volume = np.load(npy_path, mmap_mode="r")
+        self.occupancy_min = occupancy_min
+        self.max_reject = max_reject
+
+    def _sample_clean(self, rng: np.random.Generator) -> np.ndarray:
+        pz, py, px = self.patch
+        sz, sy, sx = self.volume.shape
+        patch = None
+        for _ in range(self.max_reject):
+            z0 = int(rng.integers(0, sz - pz + 1))
+            y0 = int(rng.integers(0, sy - py + 1))
+            x0 = int(rng.integers(0, sx - px + 1))
+            patch = np.asarray(self.volume[z0 : z0 + pz, y0 : y0 + py, x0 : x0 + px])
+            if float((patch > 0).mean()) >= self.occupancy_min:
+                return patch
+        return patch

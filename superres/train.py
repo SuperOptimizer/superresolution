@@ -1,12 +1,18 @@
 """Config-driven training loop.
 
 Charbonnier (air-masked) + data-consistency, AdamW, GroupNorm model (so CPU batch
-works), bf16 autocast guarded to CUDA. `--smoke` runs a few steps on synthetic data
-to prove the loop end-to-end on CPU.
+works), bf16 autocast on CUDA. Supports three data sources (cfg["data"]["source"]):
+  - "synthetic": procedural volumes, no network (also forced by --smoke)
+  - "cached":    a local .npy cube produced by scripts/cache_roi.py (fast NVMe)
+  - "s3"/local:  per-patch reads from a Zarr3D (slow; prefer "cached" for real runs)
+
+Real-run features: throughput logging, gradient clipping, periodic spectrum
+validation on a held-out patch, checkpoint + report sync to S3, and resume.
 """
 from __future__ import annotations
 
-import os
+import subprocess
+import time
 from pathlib import Path
 
 import numpy as np
@@ -14,10 +20,16 @@ import torch
 from torch.utils.data import DataLoader
 
 from .config import load_config
-from .data import PatchDataset, SyntheticPatchDataset
+from .data import (
+    PatchDataset,
+    SyntheticPatchDataset,
+    CachedVolumeDataset,
+    robust_normalize,
+)
 from .degradation import DegradationRanges, RandomDegradation
 from .model import build_model, count_params
 from .losses import charbonnier, air_mask, data_consistency_loss
+from .spectrum import overshoot_metric
 
 
 def build_dataset(cfg: dict, smoke: bool, length: int, return_params: bool = True):
@@ -40,7 +52,14 @@ def build_dataset(cfg: dict, smoke: bool, length: int, return_params: bool = Tru
             patch=tuple(d["patch"]),
             **common,
         )
-    # real volume (S3 or local)
+    if source == "cached":
+        return CachedVolumeDataset(
+            d["cache_path"],
+            patch=tuple(d["patch"]),
+            occupancy_min=d.get("occupancy_min", 0.5),
+            **common,
+        )
+    # real volume (S3 or local) -- per-patch reads
     from .s3zarr import open_s3, open_local
 
     if d.get("local_path"):
@@ -59,7 +78,6 @@ def _collate(batch):
     xs = torch.stack([b[0] for b in batch])
     ys = torch.stack([b[1] for b in batch])
     params = [b[2] for b in batch]
-    # gather per-sample sigmas for the data-consistency term
     merged = {
         "sigma_z": [p["sigma_z"] for p in params],
         "sigma_xy": [p["sigma_xy"] for p in params],
@@ -67,7 +85,59 @@ def _collate(batch):
     return xs, ys, merged
 
 
-def train(config_path: str, smoke: bool = False, max_steps: int | None = None):
+def _s3_sync(local_dir: Path, s3_prefix: str):
+    """Best-effort upload of a directory to S3 via the AWS CLI (instance role)."""
+    if not s3_prefix:
+        return
+    try:
+        subprocess.run(
+            ["aws", "s3", "sync", str(local_dir), s3_prefix, "--only-show-errors"],
+            check=False, timeout=600,
+        )
+        print(f"  [s3] synced {local_dir} -> {s3_prefix}")
+    except Exception as e:  # never let a sync failure kill training
+        print(f"  [s3] sync failed: {e}")
+
+
+@torch.no_grad()
+def _spectrum_check(model, cfg, device, use_amp) -> dict:
+    """Degrade -> restore one held-out synthetic-or-real patch; report overshoot."""
+    d = cfg["data"]
+    patch = tuple(d["patch"])
+    rng = np.random.default_rng(98765)
+    src = d.get("source", "synthetic")
+    if src == "cached" and Path(d.get("cache_path", "")).exists():
+        vol = np.load(d["cache_path"], mmap_mode="r")
+        sz, sy, sx = vol.shape
+        pz, py, px = patch
+        # find an occupied patch
+        clean = None
+        for _ in range(40):
+            z0 = int(rng.integers(0, sz - pz + 1)); y0 = int(rng.integers(0, sy - py + 1)); x0 = int(rng.integers(0, sx - px + 1))
+            c = np.asarray(vol[z0:z0+pz, y0:y0+py, x0:x0+px])
+            if (c > 0).mean() >= d.get("occupancy_min", 0.5):
+                clean = c; break
+        if clean is None:
+            clean = c
+        clean = robust_normalize(clean, d.get("norm_low_pct", 0.5), d.get("norm_high_pct", 99.5))
+    else:
+        from .data import make_synthetic_volume
+        clean = robust_normalize(make_synthetic_volume(patch, rng))
+    deg = RandomDegradation(DegradationRanges.from_config(cfg["degradation"]))
+    degraded, _ = deg.apply(clean, rng)
+    x = torch.from_numpy(degraded[None, None]).float().to(device)
+    ctx = torch.autocast("cuda", dtype=torch.bfloat16) if use_amp else _nullctx()
+    with ctx:
+        pred = model(x)
+    restored = pred[0, 0].float().cpu().numpy()
+    m_in = overshoot_metric(degraded, clean)
+    m_out = overshoot_metric(restored, clean)
+    return {"in_gap": m_in["mean_log_gap"], "out_gap": m_out["mean_log_gap"],
+            "overshoot": m_out["overshoot_ratio"]}
+
+
+def train(config_path: str, smoke: bool = False, max_steps: int | None = None,
+          resume: str | None = None):
     cfg = load_config(config_path)
     torch.manual_seed(cfg.get("seed", 0))
     np.random.seed(cfg.get("seed", 0))
@@ -76,7 +146,11 @@ def train(config_path: str, smoke: bool = False, max_steps: int | None = None):
     lcfg = cfg["loss"]
     steps = max_steps if max_steps is not None else int(tcfg["steps"])
     device = "cuda" if torch.cuda.is_available() else "cpu"
-    use_amp = bool(tcfg.get("amp_bf16", False)) and device == "cuda"
+    use_amp = bool(tcfg.get("amp_bf16", device == "cuda")) and device == "cuda"
+    if device == "cuda":
+        torch.backends.cuda.matmul.allow_tf32 = True
+        torch.backends.cudnn.allow_tf32 = True
+        torch.backends.cudnn.benchmark = True
 
     ds = build_dataset(cfg, smoke, length=steps * int(tcfg["batch_size"]))
     loader = DataLoader(
@@ -85,27 +159,59 @@ def train(config_path: str, smoke: bool = False, max_steps: int | None = None):
         num_workers=int(tcfg.get("num_workers", 0)),
         collate_fn=_collate,
         drop_last=True,
+        pin_memory=(device == "cuda"),
+        persistent_workers=bool(tcfg.get("num_workers", 0)),
+        prefetch_factor=(int(tcfg.get("prefetch_factor", 4)) if tcfg.get("num_workers", 0) else None),
     )
 
     model = build_model(cfg["model"]).to(device)
-    print(f"model params: {count_params(model):,}  device: {device}")
+    if device == "cuda":
+        model = model.to(memory_format=torch.channels_last_3d)
+    print(f"model params: {count_params(model):,}  device: {device}  bf16={use_amp}  "
+          f"source={cfg['data'].get('source')}")
     opt = torch.optim.AdamW(
         model.parameters(), lr=float(tcfg["lr"]), weight_decay=float(tcfg["weight_decay"])
     )
 
+    start_step = 0
+    if resume and Path(resume).exists():
+        ck = torch.load(resume, map_location=device, weights_only=False)
+        model.load_state_dict(ck["model"])
+        if "opt" in ck:
+            opt.load_state_dict(ck["opt"])
+        start_step = int(ck.get("step", 0))
+        print(f"resumed from {resume} at step {start_step}")
+
     ckpt_dir = Path(tcfg.get("ckpt_dir", "checkpoints"))
     ckpt_dir.mkdir(parents=True, exist_ok=True)
+    s3_prefix = tcfg.get("s3_sync", "")
     dc_w = float(lcfg.get("data_consistency_weight", 0.0))
     eps = float(lcfg.get("charbonnier_eps", 1e-3))
     mask_air = bool(lcfg.get("mask_air", True))
+    grad_clip = float(tcfg.get("grad_clip", 1.0))
+    log_every = max(1, int(tcfg.get("log_every", tcfg.get("val_every", 50))))
+    val_every = max(1, int(tcfg.get("val_every", 1000)))
+    ckpt_every = int(tcfg.get("ckpt_every", 2000))
+
+    def save(step, tag="latest"):
+        path = ckpt_dir / f"{tag}.pt"
+        torch.save({"model": model.state_dict(), "opt": opt.state_dict(),
+                    "cfg": cfg, "step": step}, path)
+        return path
 
     model.train()
-    step = 0
+    step = start_step
     last_loss = None
+    t_win = time.time()
+    seen = 0
     for x, y, params in loader:
         if step >= steps:
             break
-        x, y = x.to(device), y.to(device)
+        x = x.to(device, non_blocking=True)
+        y = y.to(device, non_blocking=True)
+        if device == "cuda":
+            x = x.to(memory_format=torch.channels_last_3d)
+            y = y.to(memory_format=torch.channels_last_3d)
         opt.zero_grad(set_to_none=True)
         ctx = torch.autocast("cuda", dtype=torch.bfloat16) if use_amp else _nullctx()
         with ctx:
@@ -115,18 +221,34 @@ def train(config_path: str, smoke: bool = False, max_steps: int | None = None):
             if dc_w > 0:
                 loss = loss + dc_w * data_consistency_loss(pred, x, params, eps=eps)
         loss.backward()
+        if grad_clip > 0:
+            torch.nn.utils.clip_grad_norm_(model.parameters(), grad_clip)
         opt.step()
         last_loss = float(loss.detach().cpu())
-        if step % max(1, int(tcfg.get("val_every", 1000))) == 0:
-            print(f"step {step:6d}  loss {last_loss:.5f}")
-        if (step + 1) % int(tcfg.get("ckpt_every", 2000)) == 0:
-            torch.save(
-                {"model": model.state_dict(), "cfg": cfg, "step": step},
-                ckpt_dir / "latest.pt",
-            )
+        seen += 1
+
+        if step % log_every == 0:
+            dt = time.time() - t_win
+            ips = seen / dt if dt > 0 else 0.0
+            print(f"step {step:6d}  loss {last_loss:.5f}  {ips:.2f} it/s  "
+                  f"({ips*int(tcfg['batch_size']):.1f} patches/s)", flush=True)
+            t_win = time.time(); seen = 0
+
+        if step > start_step and step % val_every == 0:
+            model.eval()
+            s = _spectrum_check(model, cfg, device, use_amp)
+            model.train()
+            print(f"  [val] spectrum gap in={s['in_gap']:.3f} -> out={s['out_gap']:.3f}  "
+                  f"overshoot={s['overshoot']:.2f}  (want out<in, overshoot<~1.1)", flush=True)
+
+        if (step + 1) % ckpt_every == 0:
+            p = save(step)
+            print(f"  [ckpt] step {step} -> {p}", flush=True)
+            _s3_sync(ckpt_dir, s3_prefix)
         step += 1
 
-    torch.save({"model": model.state_dict(), "cfg": cfg, "step": step}, ckpt_dir / "latest.pt")
+    save(step)
+    _s3_sync(ckpt_dir, s3_prefix)
     print(f"done. final loss {last_loss}. checkpoint -> {ckpt_dir/'latest.pt'}")
     return last_loss
 

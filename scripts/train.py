@@ -19,8 +19,9 @@ def main():
     ap.add_argument("--smoke", action="store_true",
                     help="force synthetic data (no network); for CPU smoke testing")
     ap.add_argument("--steps", type=int, default=None, help="override training steps")
+    ap.add_argument("--resume", default=None, help="checkpoint .pt to resume from")
     args = ap.parse_args()
-    train(args.config, smoke=args.smoke, max_steps=args.steps)
+    train(args.config, smoke=args.smoke, max_steps=args.steps, resume=args.resume)
 
 
 if __name__ == "__main__":
