@@ -156,12 +156,20 @@ def train(config_path: str, smoke: bool = False, max_steps: int | None = None,
         torch.backends.cudnn.allow_tf32 = True
         torch.backends.cudnn.benchmark = True
 
+    # GPU-side degradation: loader returns clean-only patches (cheap), the train
+    # step applies PSF/noise/quant on-device. Avoids the CPU loader starving the GPU.
+    gpu_degrade = bool(tcfg.get("gpu_degrade", device == "cuda")) and device == "cuda"
     ds = build_dataset(cfg, smoke, length=steps * int(tcfg["batch_size"]))
+    gdeg = None
+    if gpu_degrade:
+        from .gpu_degrade import GPUDegradation
+        ds.clean_only = True
+        gdeg = GPUDegradation(DegradationRanges.from_config(cfg["degradation"]))
     loader = DataLoader(
         ds,
         batch_size=int(tcfg["batch_size"]),
         num_workers=int(tcfg.get("num_workers", 0)),
-        collate_fn=_collate,
+        collate_fn=(None if gpu_degrade else _collate),
         drop_last=True,
         pin_memory=(device == "cuda"),
         persistent_workers=bool(tcfg.get("num_workers", 0)),
@@ -203,16 +211,23 @@ def train(config_path: str, smoke: bool = False, max_steps: int | None = None,
                     "cfg": cfg, "step": step}, path)
         return path
 
+    deg_rng = np.random.default_rng(cfg.get("seed", 0) + 777)
     model.train()
     step = start_step
     last_loss = None
     t_win = time.time()
     seen = 0
-    for x, y, params in loader:
+    for batch in loader:
         if step >= steps:
             break
-        x = x.to(device, non_blocking=True)
-        y = y.to(device, non_blocking=True)
+        if gpu_degrade:
+            y = batch.to(device, non_blocking=True)          # clean target
+            with torch.no_grad():
+                x, params = gdeg.apply(y, deg_rng)            # degrade on GPU
+        else:
+            x, y, params = batch
+            x = x.to(device, non_blocking=True)
+            y = y.to(device, non_blocking=True)
         if device == "cuda":
             x = x.to(memory_format=torch.channels_last_3d)
             y = y.to(memory_format=torch.channels_last_3d)

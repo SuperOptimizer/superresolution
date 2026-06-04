@@ -55,6 +55,7 @@
     "num_workers": 6,
     "prefetch_factor": 4,
     "grad_clip": 1.0,
+    "gpu_degrade": true,
     "log_every": 25,
     "val_every": 250,
     "ckpt_every": 250,

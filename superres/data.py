@@ -95,6 +95,9 @@ class _BasePatchDataset(Dataset):
         self.length = length
         self.seed = seed
         self.return_params = return_params
+        # When True, __getitem__ returns only the clean patch; degradation is done
+        # downstream (e.g. on GPU) to avoid the CPU loader becoming the bottleneck.
+        self.clean_only = False
 
     def __len__(self) -> int:
         return self.length
@@ -112,6 +115,8 @@ class _BasePatchDataset(Dataset):
         clean = robust_normalize(clean, self.low_pct, self.high_pct)
         if self.augment:
             clean = random_symmetry(clean, rng, self.inplane_only)
+        if self.clean_only:
+            return torch.from_numpy(clean[None]).float()   # (1,z,y,x); degrade on GPU
         degraded, params = self.degradation.apply(clean, rng)
         x = torch.from_numpy(degraded[None]).float()   # (1, z, y, x)
         y = torch.from_numpy(clean[None]).float()
