@@ -177,15 +177,21 @@ def train(config_path: str, smoke: bool = False, max_steps: int | None = None,
         from .gpu_degrade import GPUDegradation
         ds.clean_only = True
         gdeg = GPUDegradation(DegradationRanges.from_config(cfg["degradation"]))
+    nw = int(tcfg.get("num_workers", 0))
+    # Force 'fork' so workers inherit the in-RAM cube via copy-on-write instead of
+    # pickling it (Python 3.14 defaults to forkserver/spawn, which tries to pickle
+    # the multi-GB array to each worker and fails / wastes RAM).
+    mp_ctx = torch.multiprocessing.get_context("fork") if nw > 0 else None
     loader = DataLoader(
         ds,
         batch_size=int(tcfg["batch_size"]),
-        num_workers=int(tcfg.get("num_workers", 0)),
+        num_workers=nw,
         collate_fn=(None if gpu_degrade else _collate),
         drop_last=True,
         pin_memory=(device == "cuda"),
-        persistent_workers=bool(tcfg.get("num_workers", 0)),
-        prefetch_factor=(int(tcfg.get("prefetch_factor", 4)) if tcfg.get("num_workers", 0) else None),
+        persistent_workers=bool(nw),
+        prefetch_factor=(int(tcfg.get("prefetch_factor", 4)) if nw else None),
+        multiprocessing_context=mp_ctx,
     )
 
     model = build_model(cfg["model"]).to(device)
