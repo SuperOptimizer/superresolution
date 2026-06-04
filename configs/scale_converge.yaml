@@ -40,7 +40,7 @@
   "loss": {
     "charbonnier_eps": 1.0e-3,
     "mask_air": true,
-    "data_consistency_weight": 0.1
+    "data_consistency_weight": 0.3
   },
 
   "train": {
