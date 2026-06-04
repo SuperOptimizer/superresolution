@@ -216,3 +216,11 @@ __marimo__/
 
 # Streamlit
 .streamlit/secrets.toml
+
+# superresolution project artifacts
+checkpoints/
+checkpoints_smoke/
+*.npy
+*.pt
+*.spectrum.csv
+*.spectrum.png

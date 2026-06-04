@@ -1,0 +1,59 @@
+# Tiny CPU smoke config -- synthetic data, no network, runs in seconds.
+{
+  "seed": 0,
+
+  "data": {
+    "source": "synthetic",       # procedural fiber-like volumes; no S3
+    "synthetic_shape": [96, 96, 96],
+    "patch": [32, 32, 32],
+    "occupancy_min": 0.0,        # synthetic volume is fully occupied
+    "norm_low_pct": 0.5,
+    "norm_high_pct": 99.5,
+    "augment": true,
+    "augment_inplane_only": false
+  },
+
+  "degradation": {
+    "sigma_xy": [0.6, 1.2],
+    "sigma_z":  [0.8, 1.6],
+    "noise_sigma": [0.01, 0.03],
+    "noise_color": [0.0, 1.0],
+    "shift": [-0.5, 0.5],
+    "intensity_gain": [0.95, 1.05],
+    "intensity_bias": [-0.02, 0.02],
+    "u8_quantize": true
+  },
+
+  "model": {
+    "in_ch": 1,
+    "base_width": 8,
+    "levels": 2,
+    "blocks_per_level": 1,
+    "residual": true
+  },
+
+  "loss": {
+    "charbonnier_eps": 1.0e-3,
+    "mask_air": false,
+    "data_consistency_weight": 0.1
+  },
+
+  "train": {
+    "steps": 20,
+    "batch_size": 2,
+    "lr": 1.0e-3,
+    "weight_decay": 1.0e-4,
+    "num_workers": 0,
+    "val_every": 10,
+    "ckpt_every": 10,
+    "ckpt_dir": "checkpoints_smoke",
+    "amp_bf16": false
+  },
+
+  "infer": {
+    "window": [48, 48, 48],
+    "overlap": 8,
+    "occupancy_skip": true,
+    "amp_bf16": false
+  }
+}

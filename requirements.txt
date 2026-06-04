@@ -1,0 +1,15 @@
+# Core (required)
+numpy>=1.24
+scipy>=1.10
+torch>=2.0
+pyyaml>=6.0
+
+# Testing
+pytest>=7.0
+
+# Optional — improves UX / performance, the project degrades gracefully without them:
+#   matplotlib   # spectrum plots (else CSV is written)
+#   boto3        # faster S3 chunk fetch (else the awscli CLI subprocess is used)
+#
+# S3 access uses the AWS CLI (`aws`) via `--no-sign-request` when boto3 is absent.
+# The public bucket needs no credentials.
