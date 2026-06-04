@@ -73,6 +73,55 @@ def quality_metrics(pred: np.ndarray, target: np.ndarray, degraded: np.ndarray |
     return out
 
 
+def effective_resolution(vol: np.ndarray, nbins: int = 64,
+                         noise_frac: float = 0.05) -> float:
+    """Effective resolution as a fraction of grid Nyquist (0..1).
+
+    The idea (the "how much real resolution is actually here" measure): a volume
+    samples up to Nyquist (freq 0.5 cyc/voxel) but its SIGNAL only fills part of
+    that band -- beyond f_eff the spectrum is just noise. f_eff/Nyquist is the
+    effective resolution. A blurred 1000^3 volume whose signal dies at half Nyquist
+    genuinely holds only ~500^3 of information.
+
+    We find f_eff as the highest frequency where radial power still exceeds the
+    noise floor (estimated as `noise_frac` of peak power, after subtracting the
+    flat high-freq tail). Returns f_eff / 0.5 in [0,1].
+    """
+    freqs, power = radial_power_spectrum(vol, nbins)
+    if power.max() <= 0:
+        return 0.0
+    # noise floor: median of the top-quartile (highest-freq) bins
+    tail = power[int(0.75 * nbins):]
+    floor = float(np.median(tail)) if tail.size else 0.0
+    sig = power - floor
+    peak = sig.max()
+    if peak <= 0:
+        return 0.0
+    thresh = noise_frac * peak
+    above = np.where(sig > thresh)[0]
+    if above.size == 0:
+        return 0.0
+    f_eff = freqs[above[-1]]          # highest freq still above noise
+    return float(f_eff / 0.5)         # fraction of Nyquist
+
+
+def resolution_gain(restored: np.ndarray, degraded: np.ndarray,
+                    nbins: int = 64) -> dict:
+    """The "Nx super-resolution" number: effective-resolution ratio after vs before.
+
+    eff_before = degraded input's effective resolution (frac of Nyquist)
+    eff_after  = restored output's effective resolution
+    factor     = eff_after / eff_before  (e.g. 1.6 == "1.6x effective resolution")
+
+    Bounded by Nyquist (eff<=1), so it CANNOT report runaway gain -- a built-in
+    honesty cap. To convert to physical microns: phys_eff = voxel_um / eff.
+    """
+    eff_before = effective_resolution(degraded, nbins)
+    eff_after = effective_resolution(restored, nbins)
+    factor = (eff_after / eff_before) if eff_before > 1e-6 else 0.0
+    return {"eff_before": eff_before, "eff_after": eff_after, "factor": factor}
+
+
 def radial_power_spectrum(vol: np.ndarray, nbins: int = 64) -> tuple[np.ndarray, np.ndarray]:
     """Radially-averaged 3-D power spectrum.
 
