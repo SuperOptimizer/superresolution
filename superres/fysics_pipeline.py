@@ -130,6 +130,14 @@ class Calibration:
         self.norm_hi = norm_hi        # u8 hi for global normalization
         self.air_thresh = air_thresh  # Otsu air threshold [0,1]
         self.zdrift_factor = zdrift_factor  # per-z correction factor array (float32)
+        # ---- TUNED per-stage config (set by calibrate_prepass; sensible defaults) ----
+        self.do_deconv = True
+        self.deconv_reg = -1.0          # <=0 -> kernel auto
+        self.do_denoise = True
+        self.denoise_radius = 2
+        self.do_diffusion = False
+        self.diffusion_strength = 2
+        self.tuning = {}                # per-stage chosen value + metric panel (for inspection)
 
     def scaled_phys(self) -> _Phys:
         p = _Phys(self.phys.delta_beta * self.db_scale, self.phys.energy_kev,
@@ -175,37 +183,202 @@ def calibrate(md_phys: dict, sample_chunks, window=None,
 
 
 # ---------------------------------------------------------------- the per-tile chain
+# ---------------------------------------------------------------- calibration pre-pass
+def _metric_panel(ref, out):
+    """Score a processed tile `out` vs the (deconvolved) reference `ref`, both float
+    [0,1]-ish, across a BUCKET of metrics. Returns a dict of normalized sub-scores in
+    [0,1] (1 = good) plus the raw numbers. Roughly-equal-weight by design; hard
+    constraints are flagged separately. Metrics span the ways processing helps or harms:
+    detail-retention, noise, contrast, sheet/gap structure, and safety."""
+    from numpy.fft import fftn, fftshift
+    try:
+        from scipy.ndimage import gaussian_filter
+    except Exception:
+        gaussian_filter = None
+    def rpsd(v):
+        v = v - v.mean(); F = np.abs(fftshift(fftn(v))) ** 2
+        n = v.shape[0]; c = n // 2
+        z, y, x = np.indices(v.shape) - c; r = np.sqrt(z*z + y*y + x*x).astype(int)
+        return (np.bincount(r.ravel(), F.ravel()) / np.maximum(np.bincount(r.ravel()), 1))[:c]
+    pr, po = rpsd(ref), rpsd(out); nyq = len(pr) - 1
+    def band(p, a, b): return p[int(a*nyq):int(b*nyq)].sum() + 1e-12
+    midret = band(po, 0.17, 0.5) / band(pr, 0.17, 0.5)     # >=1 keeps texture band
+    hiret = band(po, 0.5, 1.0) / band(pr, 0.5, 1.0)
+    def hp(v): return v - gaussian_filter(v, 1.0) if gaussian_filter else v - v.mean()
+    def flatnoise(v):
+        if gaussian_filter is None: return float(v.std())
+        s = []
+        for z in range(0, v.shape[0]-16, 16):
+            for y in range(0, v.shape[1]-16, 16):
+                for x in range(0, v.shape[2]-16, 16):
+                    p = v[z:z+16, y:y+16, x:x+16]
+                    if (p > 0.06).mean() > 0.9 and p.std() < 0.1:
+                        s.append(hp(p).std())
+        return float(np.median(s)) if s else float(hp(v).std())
+    tex_r, tex_o = float(hp(ref).std()), float(hp(out).std())
+    n_r, n_o = flatnoise(ref), flatnoise(out)
+    noise_ratio = n_o / (n_r + 1e-9)                        # <1 = denoised
+    tex_ratio = tex_o / (tex_r + 1e-9)
+    legibility = (tex_o / (n_o + 1e-9)) / (tex_r / (n_r + 1e-9) + 1e-9)
+    clip = float((out <= 0.001).mean() + (out >= 0.999).mean())
+    finite = bool(np.isfinite(out).all())
+    # normalize each to [0,1] (1 good), roughly comparable scales:
+    sub = {
+        "detail_mid":  min(midret, 1.0),                    # keep texture band (cap at 1)
+        "detail_high": min(hiret, 1.0),
+        "texture":     min(tex_ratio, 1.5) / 1.5,           # more texture = better, capped
+        "denoise":     max(0.0, 1.0 - noise_ratio),         # lower noise = better
+        "legibility":  min(legibility / 2.0, 1.0),          # tex/noise gain, ~2x=full
+        "no_clip":     max(0.0, 1.0 - clip * 5.0),          # penalize clipping pile-up
+    }
+    score = sum(sub.values()) / len(sub) if finite else 0.0
+    # HARD CONSTRAINTS (reject regardless of score). The guard against over-smoothing is
+    # on TEXTURE retention -- real structure -- NOT raw mid-band power (which also holds
+    # the noise we legitimately remove; denoising lowers it without losing structure).
+    # Allow texture to drop modestly (a denoise removes some noise-driven "texture") but
+    # not collapse: tex_ratio >= 0.70 AND legibility must not get WORSE than the input.
+    ok = (finite and tex_ratio >= 0.70 and legibility >= 0.98 and clip < 0.06)
+    return {"score": score, "ok": ok, "sub": sub,
+            "raw": {"midret": midret, "hiret": hiret, "noise_ratio": noise_ratio,
+                    "tex_ratio": tex_ratio, "legibility": legibility, "clip": clip}}
+
+
+def calibrate_prepass(md_phys: dict, sample_tiles, auto_deltabeta=True, verbose=False):
+    """CALIBRATION PRE-PASS: measure the volume on a few sample tiles and TUNE the whole
+    chain across a BUCKET of metrics (roughly equal weight, hard safety constraints).
+
+    For each stage it sweeps the strength, scores every candidate across the metric panel
+    on the samples, and picks the best -- or turns the stage OFF if nothing beats the
+    unprocessed input. This makes the chain RESOLUTION-ADAPTIVE by measurement: e.g. on a
+    coarse/noisy 45um volume denoise backs off (every candidate fails detail-retention),
+    while on a fine 2.4um volume it applies real denoise (a candidate both denoises AND
+    keeps detail). sample_tiles: list of uint8 textured tiles (>=64^3).
+
+    Returns a fully-tuned Calibration (do_deconv/deconv_reg, do_denoise/guided_eps,
+    do_diffusion/strength) ready for the streaming pass."""
+    L = lib()
+    # base calibration (physics, db_scale, halo, noise_ref)
+    samp01 = [t.astype(np.float32) / 255.0 for t in sample_tiles]
+    cal = calibrate(md_phys, samp01, auto_deltabeta=auto_deltabeta)
+    f32p = C.POINTER(C.c_float)
+
+    def deconv(v):
+        a = np.ascontiguousarray(v, np.float32); o = np.empty_like(a); ph = cal.scaled_phys()
+        L.fy_deconvolve(a.ctypes.data_as(f32p), o.ctypes.data_as(f32p),
+                        *a.shape, C.byref(ph), C.c_double(cal.deconv_reg))
+        return o
+    def guided(v, eps):
+        a = np.ascontiguousarray(v, np.float32); o = np.empty_like(a)
+        L.fy_guided_denoise(a.ctypes.data_as(f32p), o.ctypes.data_as(f32p), *a.shape, 2, eps)
+        return o
+    def diffuse(v, s):
+        a = np.ascontiguousarray(v, np.float32); o = np.empty_like(a)
+        L.fy_coherence_diffusion_auto(a.ctypes.data_as(f32p), o.ctypes.data_as(f32p), *a.shape, int(s))
+        return o
+
+    def mean_score(cands):
+        # average the panel score across all sample tiles for a candidate function
+        per_tile = []
+        for f, ref in cands:
+            m = _metric_panel(ref, f())
+            per_tile.append(m)
+        sc = np.mean([m["score"] for m in per_tile])
+        ok = all(m["ok"] for m in per_tile)
+        return sc, ok, per_tile
+
+    tuning = {}
+
+    # ---- 1. DECONV strength (reg). Sweep; pick best-scoring vs RAW that's also OK. ----
+    raw = samp01
+    base_ref = raw  # reference for deconv scoring is the RAW tile (deconv should improve it)
+    best = ("off", 0.0, None)
+    # candidate regs (lower=sharper+noisier); -1 = kernel auto
+    for reg in [-1.0, 0.005, 0.015, 0.05, 0.15]:
+        cal.deconv_reg = reg
+        sc, ok, _ = mean_score([(lambda t=t: deconv(t), t) for t in raw])
+        if verbose: print(f"  deconv reg={reg}: score={sc:.3f} ok={ok}")
+        if ok and sc > best[1]:
+            best = (reg, sc, None)
+    # compare to NO deconv (identity score=panel(raw,raw))
+    sc_off, _, _ = mean_score([(lambda t=t: t, t) for t in raw])
+    if best[1] > sc_off and best[0] != "off":
+        cal.do_deconv = True; cal.deconv_reg = best[0]
+    else:
+        cal.do_deconv = False; cal.deconv_reg = -1.0
+    tuning["deconv"] = {"on": cal.do_deconv, "reg": cal.deconv_reg, "score": best[1], "off_score": sc_off}
+
+    # working set after the chosen deconv (the denoise/diffusion operate on this)
+    decd = [deconv(t) if cal.do_deconv else t for t in raw]
+
+    # ---- 2. DENOISE eps. The reference is the DECONVOLVED tile; pick the strongest eps
+    #         that still passes the panel (detail >=0.90). Off if nothing helps. ----
+    eps_base = cal.guided_eps_raw
+    best = (0.0, mean_score([(lambda t=t: t, t) for t in decd])[0])  # eps=0 -> identity
+    for mult in [0.25, 0.5, 1.0, 2.0, 4.0]:
+        eps = eps_base * mult
+        sc, ok, _ = mean_score([(lambda t=t, e=eps: guided(t, e), t) for t in decd])
+        if verbose: print(f"  denoise eps={eps:.4f}: score={sc:.3f} ok={ok}")
+        if ok and sc > best[1]:
+            best = (eps, sc)
+    if best[0] > 0:
+        cal.do_denoise = True; cal.guided_eps = best[0]
+    else:
+        cal.do_denoise = False; cal.guided_eps = 0.0
+    tuning["denoise"] = {"on": cal.do_denoise, "eps": cal.guided_eps, "score": best[1]}
+
+    dnd = [guided(t, cal.guided_eps) if cal.do_denoise else t for t in decd]
+
+    # ---- 3. DIFFUSION (clean sheets). Only if a strength improves the panel (it has its
+    #         own gap-preservation built in). Off by default unless it scores. ----
+    best = (0, mean_score([(lambda t=t: t, t) for t in dnd])[0])
+    for s in [1, 2]:
+        sc, ok, _ = mean_score([(lambda t=t, ss=s: diffuse(t, ss), t) for t in dnd])
+        if verbose: print(f"  diffusion strength={s}: score={sc:.3f} ok={ok}")
+        if ok and sc > best[1] * 1.02:   # require a real improvement (2%) to enable
+            best = (s, sc)
+    cal.do_diffusion = best[0] > 0; cal.diffusion_strength = best[0] or 2
+    tuning["diffusion"] = {"on": cal.do_diffusion, "strength": cal.diffusion_strength, "score": best[1]}
+
+    cal.tuning = tuning
+    if verbose:
+        print(f"TUNED: deconv={cal.do_deconv}(reg={cal.deconv_reg}) "
+              f"denoise={cal.do_denoise}(eps={cal.guided_eps:.4f}) "
+              f"diffusion={cal.do_diffusion}(s={cal.diffusion_strength})")
+    return cal
+
+
 def process_tile(block_u8: np.ndarray, cal: Calibration,
-                 do_deconv=True, do_denoise=True, do_diffusion=False,
-                 diffusion_strength=2) -> np.ndarray:
+                 do_deconv=None, do_denoise=None, do_diffusion=None,
+                 diffusion_strength=None) -> np.ndarray:
     """Run the full chain on one tile (with halo). Input/output uint8.
 
-    Order: u8 -> [phys] -> deconv(scaled db, auto reg) -> denoise -> [diffusion] ->
-    -> u8. The HALO is part of block_u8; the caller crops the inner tile after.
+    Order: u8 -> [phys] -> deconv -> denoise -> [diffusion] -> u8. The per-stage on/off
+    and STRENGTHS come from the (calibrated) `cal` by default -- pass explicit args only
+    to override. The HALO is part of block_u8; the caller crops the inner tile after.
     """
     L = lib()
     nz, ny, nx = block_u8.shape
-    n = nz * ny * nx
+    # use the TUNED config unless explicitly overridden
+    do_deconv = cal.do_deconv if do_deconv is None else do_deconv
+    do_denoise = cal.do_denoise if do_denoise is None else do_denoise
+    do_diffusion = cal.do_diffusion if do_diffusion is None else do_diffusion
+    diffusion_strength = cal.diffusion_strength if diffusion_strength is None else diffusion_strength
 
-    # to float [0,1] (the kernels operate in this normalized scale; dewindow is a
-    # linear reparam that the deconv/denoise are invariant to up to scale, so we
-    # keep [0,1] for the in-pipeline math and only dewindow when PHYSICAL units are
-    # requested downstream).
     cur = (block_u8.astype(np.float32) / 255.0)
 
     if do_deconv:
         inp, ip = _fp(cur)
         out = np.empty_like(inp); op = out.ctypes.data_as(C.POINTER(C.c_float))
         ph = cal.scaled_phys()
-        rc = L.fy_deconvolve(ip, op, nz, ny, nx, C.byref(ph), -1.0)  # reg<=0 -> auto
+        rc = L.fy_deconvolve(ip, op, nz, ny, nx, C.byref(ph), C.c_double(cal.deconv_reg))
         if rc != 0:
             raise RuntimeError("fy_deconvolve failed")
         cur = out
 
-    if do_denoise:
+    if do_denoise and cal.guided_eps > 0:
         inp, ip = _fp(cur)
         out = np.empty_like(inp); op = out.ctypes.data_as(C.POINTER(C.c_float))
-        rc = L.fy_guided_denoise(ip, op, nz, ny, nx, 2, cal.guided_eps)
+        rc = L.fy_guided_denoise(ip, op, nz, ny, nx, cal.denoise_radius, cal.guided_eps)
         if rc != 0:
             raise RuntimeError("fy_guided_denoise failed")
         cur = out

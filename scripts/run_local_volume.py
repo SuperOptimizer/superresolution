@@ -105,8 +105,17 @@ def main():
                    pixel_um=a.get("detector", {}).get("samplePixelSize", 0.045532) * 1000,
                    unsharp_sigma=ph.get("unsharp_sigma", 1.2), unsharp_coeff=ph.get("unsharp_coeff", 4.0))
     print("beam mA:", a.get("machineCurrentStart"), "->", a.get("machineCurrentStop"), flush=True)
-    samp = zin.read_region(SH[0]//2, SH[1]//2, SH[2]//2, 128, 128, 128).astype(np.float32) / 255
-    cal = fp.calibrate(md_phys, [samp])
+    # calibration PRE-PASS: sample a few textured tiles, tune the whole chain across
+    # a bucket of metrics (resolution-adaptive; turns off stages that can't help).
+    samples = []
+    for (sz, sy, sx) in [(SH[0]//2, SH[1]//2, SH[2]//2), (SH[0]//2, SH[1]//3, SH[2]//2),
+                         (SH[0]//3, SH[1]//2, SH[2]//3), (2*SH[0]//3, SH[1]//2, SH[2]//2)]:
+        t = zin.read_region(sz, sy, sx, 128, 128, 128)
+        if t.std() > 20 and (t > 20).mean() > 0.5:
+            samples.append(t)
+    if not samples:
+        samples = [zin.read_region(SH[0]//2, SH[1]//2, SH[2]//2, 128, 128, 128)]
+    cal = fp.calibrate_prepass(md_phys, samples, verbose=True)
     print(f"calib db_scale={cal.db_scale:.2f} noise_ref={cal.noise_ref:.4f} eps={cal.guided_eps:.4f} halo={cal.halo}", flush=True)
 
     t0 = time.time(); last = [0]
