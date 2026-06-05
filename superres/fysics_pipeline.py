@@ -40,6 +40,10 @@ class _NoiseModel(C.Structure):
                 ("ref_intensity", C.c_double), ("n_bins_used", C.c_int)]
 
 
+class _HistState(C.Structure):
+    _fields_ = [("hist", C.c_long * 256), ("total", C.c_long)]
+
+
 def _load():
     lib = C.CDLL(_LIB)
     f32p = C.POINTER(C.c_float)
@@ -63,6 +67,19 @@ def _load():
     lib.fy_coherence_diffusion_auto.restype = C.c_int
     lib.fy_kernel_halo.argtypes = [C.POINTER(_Phys)]
     lib.fy_kernel_halo.restype = C.c_int
+    # two-pass global stats
+    lib.fy_hist_init.argtypes = [C.POINTER(_HistState)]
+    lib.fy_hist_accumulate_u8.argtypes = [C.POINTER(_HistState), u8p, C.c_size_t]
+    lib.fy_hist_percentile_u8.argtypes = [C.POINTER(_HistState), C.c_double]
+    lib.fy_hist_percentile_u8.restype = C.c_int
+    lib.fy_norm_apply_u8.argtypes = [u8p, f32p, C.c_size_t, C.c_ubyte, C.c_ubyte]
+    lib.fy_auto_air_thresh.argtypes = [C.POINTER(_HistState)]
+    lib.fy_auto_air_thresh.restype = C.c_float
+    # z-drift (shading / beam-current decay across z)
+    dp = C.POINTER(C.c_double); lp = C.POINTER(C.c_long); fp_ = C.POINTER(C.c_float)
+    lib.fy_zdrift_accumulate.argtypes = [f32p, C.c_int, C.c_int, C.c_int, C.c_int, dp, lp, C.c_float]
+    lib.fy_zdrift_finalize.argtypes = [dp, lp, C.c_int, fp_]
+    lib.fy_zdrift_apply.argtypes = [f32p, C.c_int, C.c_int, C.c_int, C.c_int, fp_]
     return lib
 
 
@@ -97,13 +114,22 @@ def physics_struct(md_phys: dict) -> _Phys:
 class Calibration:
     """Per-volume calibration computed once and reused for every tile."""
     def __init__(self, phys: _Phys, db_scale: float, noise_ref: float,
-                 guided_eps: float, halo: int, window: tuple | None):
+                 guided_eps: float, halo: int, window: tuple | None,
+                 guided_eps_raw: float = None,
+                 norm_lo: int = None, norm_hi: int = None,
+                 air_thresh: float = None, zdrift_factor=None):
         self.phys = phys
         self.db_scale = db_scale
         self.noise_ref = noise_ref
-        self.guided_eps = guided_eps
+        self.guided_eps = guided_eps          # post-deconv strength (in-pipeline)
+        self.guided_eps_raw = guided_eps_raw  # raw-noise strength (denoise-only use)
         self.halo = halo
         self.window = window  # (f32_min, f32_max) for u8<->phys, or None to keep u8 scale
+        # ---- whole-volume stats (set by the pass-1 finalize; None until then) ----
+        self.norm_lo = norm_lo        # u8 lo for global normalization
+        self.norm_hi = norm_hi        # u8 hi for global normalization
+        self.air_thresh = air_thresh  # Otsu air threshold [0,1]
+        self.zdrift_factor = zdrift_factor  # per-z correction factor array (float32)
 
     def scaled_phys(self) -> _Phys:
         p = _Phys(self.phys.delta_beta * self.db_scale, self.phys.energy_kev,
@@ -135,8 +161,17 @@ def calibrate(md_phys: dict, sample_chunks, window=None,
         if L.fy_estimate_noise(p, nz, ny, nx, 5, 10.0, 0.4, C.byref(nm)) == 0 and nm.noise_ref > 0:
             refs.append(nm.noise_ref)
     noise_ref = float(np.median(refs)) if refs else 0.02
-    guided_eps = L.fy_guided_eps_for_noise(noise_ref)
-    return Calibration(phys, db_scale, noise_ref, guided_eps, halo, window)
+    # NOTE: deconv runs BEFORE denoise and amplifies the noise ~3-4x (measured on real
+    # PHerc data: flat-region noise 1.56 -> 5.54 u8 levels after deconv). The base
+    # fy_guided_eps_for_noise is calibrated to the RAW noise, so in-pipeline (post-
+    # deconv) it under-denoises. Scale eps for the post-deconv noise: eps ~ noise^2, so
+    # a ~3.5x noise rise -> ~12x eps; empirically x4 on the linear noise (=>~ the same)
+    # restores flat noise BELOW raw while keeping texture. Skip the boost if no deconv.
+    POST_DECONV_NOISE_GAIN = 3.5
+    guided_eps_raw = L.fy_guided_eps_for_noise(noise_ref)
+    guided_eps = L.fy_guided_eps_for_noise(noise_ref * POST_DECONV_NOISE_GAIN)
+    return Calibration(phys, db_scale, noise_ref, guided_eps, halo, window,
+                       guided_eps_raw=guided_eps_raw)
 
 
 # ---------------------------------------------------------------- the per-tile chain
@@ -222,3 +257,132 @@ def run_pipeline(read_region, write_region, shape, cal: Calibration,
                 write_region(z0, y0, x0, inner)
                 processed += 1
     return {"tiles_total": total, "tiles_processed": processed}
+
+
+# ---------------------------------------------------------------- pass 1: global stats
+def accumulate_global_stats(read_region, shape, cal: Calibration, tile=256,
+                            want_norm=True, want_zdrift=True,
+                            norm_lo_pct=0.5, norm_hi_pct=99.5,
+                            zdrift_min_frac=0.05,
+                            progress=lambda *_: None):
+    """PASS 1 (streaming, cheap): accumulate WHOLE-VOLUME statistics so pass 2 can apply
+    a CONSISTENT global mapping -- the proper way to normalize a volume too big for RAM.
+
+      - global histogram -> lo/hi percentiles for normalization + Otsu air threshold
+      - per-z papyrus mean -> beam-current / shading DRIFT correction (intensity ranges
+        across the volume; metadata machineCurrentStart/Stop confirms ~1.5-13.7% decay).
+    State is tiny (256-bin histogram + 2 arrays of length Z). Mutates `cal` in place
+    (sets norm_lo/hi, air_thresh, zdrift_factor). Reads NO halo -- plain tiling.
+    """
+    L = lib()
+    Z, Y, X = shape
+    hist = _HistState(); L.fy_hist_init(C.byref(hist))
+    sums = np.zeros(Z, np.float64); counts = np.zeros(Z, np.int64)
+    sums_p = sums.ctypes.data_as(C.POINTER(C.c_double))
+    counts_p = counts.ctypes.data_as(C.POINTER(C.c_long))
+    # a papyrus threshold for zdrift, in [0,1]; use a low fixed value (air is near 0)
+    pap_thr = 0.10
+    nz = -(-Z // tile); ny = -(-Y // tile); nx = -(-X // tile)
+    total = nz * ny * nx; done = 0
+    for iz in range(nz):
+        z0 = iz * tile; tz = min(tile, Z - z0)
+        for iy in range(ny):
+            y0 = iy * tile; ty = min(tile, Y - y0)
+            for ix in range(nx):
+                x0 = ix * tile; tx = min(tile, X - x0)
+                blk = read_region(z0, y0, x0, tz, ty, tx)
+                done += 1; progress(done, total)
+                if not np.any(blk):
+                    continue
+                u8 = np.ascontiguousarray(blk, np.uint8)
+                if want_norm:
+                    L.fy_hist_accumulate_u8(C.byref(hist),
+                                            u8.ctypes.data_as(C.POINTER(C.c_ubyte)), u8.size)
+                if want_zdrift:
+                    f = np.ascontiguousarray(u8.astype(np.float32) / 255.0)
+                    L.fy_zdrift_accumulate(f.ctypes.data_as(C.POINTER(C.c_float)),
+                                           tz, ty, tx, z0, sums_p, counts_p, C.c_float(pap_thr))
+    if want_norm and hist.total > 0:
+        cal.norm_lo = int(L.fy_hist_percentile_u8(C.byref(hist), norm_lo_pct))
+        cal.norm_hi = int(L.fy_hist_percentile_u8(C.byref(hist), norm_hi_pct))
+        cal.air_thresh = float(L.fy_auto_air_thresh(C.byref(hist)))
+    if want_zdrift and counts.sum() > 0:
+        factor = np.zeros(Z, np.float32)
+        L.fy_zdrift_finalize(sums_p, counts_p, Z,
+                             factor.ctypes.data_as(C.POINTER(C.c_float)))
+        # GATE: only keep the correction if the drift is SIGNIFICANT. On a volume with
+        # little drift the smoothed factor just fits noise and ADDS spread (measured:
+        # PHercParis4 45um has ~3% drift -> correction hurt). The factor's own range is
+        # the measured drift magnitude; require > a threshold (default 5%). The metadata
+        # beam-current delta is the physical confirmation (set cal.beam_drift_frac).
+        fr = float(np.nanmax(factor)) - float(np.nanmin(factor))
+        cal.zdrift_drift_frac = fr
+        if fr >= zdrift_min_frac:
+            cal.zdrift_factor = factor
+        else:
+            cal.zdrift_factor = None  # negligible drift -> don't correct
+    return cal
+
+
+def run_pipeline_2pass(read_region, write_region, shape, cal: Calibration,
+                       tile=256, occupancy_skip=True,
+                       do_normalize=True, do_zdrift=True,
+                       do_deconv=True, do_denoise=True, do_diffusion=False,
+                       progress=lambda *_: None):
+    """Full TWO-PASS whole-volume pipeline.
+      pass 1: accumulate_global_stats (global histogram + z-drift profile)
+      pass 2: per tile -> z-drift correct + global normalize -> deconv -> denoise ->
+              [diffusion] -> write inner tile.
+    Gives CONSISTENT intensity across the whole volume (drift-corrected + globally
+    normalized) AND per-tile restoration, all streaming. The z-drift/normalize are
+    applied to the WHOLE haloed block before the local ops so seams stay clean.
+    """
+    L = lib()
+    Z, Y, X = shape
+    if do_normalize or do_zdrift:
+        progress("pass1", 0)
+        accumulate_global_stats(read_region, shape, cal, tile=tile,
+                                want_norm=do_normalize, want_zdrift=do_zdrift,
+                                progress=lambda d, t: progress("pass1", d / t))
+    halo = cal.halo
+    nz = -(-Z // tile); ny = -(-Y // tile); nx = -(-X // tile)
+    total = nz * ny * nx; done = 0; processed = 0
+    lo = cal.norm_lo if (do_normalize and cal.norm_lo is not None) else 0
+    hi = cal.norm_hi if (do_normalize and cal.norm_hi is not None) else 255
+    for iz in range(nz):
+        for iy in range(ny):
+            for ix in range(nx):
+                z0, y0, x0 = iz * tile, iy * tile, ix * tile
+                tz = min(tile, Z - z0); ty = min(tile, Y - y0); tx = min(tile, X - x0)
+                rz0, ry0, rx0 = max(0, z0 - halo), max(0, y0 - halo), max(0, x0 - halo)
+                rz1 = min(Z, z0 + tz + halo); ry1 = min(Y, y0 + ty + halo); rx1 = min(X, x0 + tx + halo)
+                blk = read_region(rz0, ry0, rx0, rz1 - rz0, ry1 - ry0, rx1 - rx0)
+                done += 1; progress("pass2", done / total)
+                if occupancy_skip and not np.any(blk):
+                    continue
+                # --- global intensity corrections on the haloed block (float [0,1]) ---
+                u8 = np.ascontiguousarray(blk, np.uint8)
+                if do_normalize and cal.norm_lo is not None:
+                    f = np.empty(u8.size, np.float32)
+                    L.fy_norm_apply_u8(u8.ctypes.data_as(C.POINTER(C.c_ubyte)),
+                                       f.ctypes.data_as(C.POINTER(C.c_float)), u8.size,
+                                       C.c_ubyte(lo), C.c_ubyte(hi))
+                    fcur = f.reshape(u8.shape)
+                else:
+                    fcur = u8.astype(np.float32) / 255.0
+                if do_zdrift and cal.zdrift_factor is not None:
+                    fcur = np.ascontiguousarray(fcur)
+                    L.fy_zdrift_apply(fcur.ctypes.data_as(C.POINTER(C.c_float)),
+                                      fcur.shape[0], fcur.shape[1], fcur.shape[2], rz0,
+                                      cal.zdrift_factor.ctypes.data_as(C.POINTER(C.c_float)))
+                # back to u8 for the per-tile chain (which re-normalizes to [0,1])
+                blk_corr = np.clip(fcur * 255.0 + 0.5, 0, 255).astype(np.uint8)
+                out = process_tile(blk_corr, cal, do_deconv=do_deconv,
+                                   do_denoise=do_denoise, do_diffusion=do_diffusion)
+                iz0, iy0, ix0 = z0 - rz0, y0 - ry0, x0 - rx0
+                inner = out[iz0:iz0 + tz, iy0:iy0 + ty, ix0:ix0 + tx]
+                write_region(z0, y0, x0, inner)
+                processed += 1
+    return {"tiles_total": total, "tiles_processed": processed,
+            "norm_lo": cal.norm_lo, "norm_hi": cal.norm_hi,
+            "air_thresh": cal.air_thresh}
