@@ -248,7 +248,7 @@ def _metric_panel(ref, out):
                     "tex_ratio": tex_ratio, "legibility": legibility, "clip": clip}}
 
 
-def calibrate_prepass(md_phys: dict, sample_tiles, auto_deltabeta=True, verbose=False):
+def calibrate_prepass(md_phys: dict, sample_tiles, auto_deltabeta=True, verbose=False, allow_diffusion=False):
     """CALIBRATION PRE-PASS: measure the volume on a few sample tiles and TUNE the whole
     chain across a BUCKET of metrics (roughly equal weight, hard safety constraints).
 
@@ -349,16 +349,25 @@ def calibrate_prepass(md_phys: dict, sample_tiles, auto_deltabeta=True, verbose=
 
     dnd = [guided(t, cal.guided_eps) if cal.do_denoise else t for t in decd]
 
-    # ---- 3. DIFFUSION (clean sheets). Only if a strength improves the panel (it has its
-    #         own gap-preservation built in). Off by default unless it scores. ----
-    best = (0, mean_score([(lambda t=t: t, t) for t in dnd])[0])
-    for s in [1, 2]:
-        sc, ok, _ = mean_score([(lambda t=t, ss=s: diffuse(t, ss), t) for t in dnd])
-        if verbose: print(f"  diffusion strength={s}: score={sc:.3f} ok={ok}")
-        if ok and sc > best[1] * 1.02:   # require a real improvement (2%) to enable
-            best = (s, sc)
-    cal.do_diffusion = best[0] > 0; cal.diffusion_strength = best[0] or 2
-    tuning["diffusion"] = {"on": cal.do_diffusion, "strength": cal.diffusion_strength, "score": best[1]}
+    # ---- 3. DIFFUSION (clean sheets). NOTE: coherence diffusion is ITERATIVE -- its
+    #         domain of dependence grows per iteration beyond a fixed tile halo, so it is
+    #         NOT cleanly tileable / seam-free in the streaming pipeline (verified: tiled
+    #         vs whole mismatches by ~30 u8). It is therefore DISABLED in the streaming
+    #         pre-pass by default; use it as a standalone (whole-region) filter where
+    #         seams don't matter. Set allow_diffusion=True only if you accept tile seams
+    #         or run it un-tiled. ----
+    if allow_diffusion:
+        best = (0, mean_score([(lambda t=t: t, t) for t in dnd])[0])
+        for s in [1, 2]:
+            sc, ok, _ = mean_score([(lambda t=t, ss=s: diffuse(t, ss), t) for t in dnd])
+            if verbose: print(f"  diffusion strength={s}: score={sc:.3f} ok={ok}")
+            if ok and sc > best[1] * 1.02:
+                best = (s, sc)
+        cal.do_diffusion = best[0] > 0; cal.diffusion_strength = best[0] or 2
+    else:
+        cal.do_diffusion = False; cal.diffusion_strength = 2
+    tuning["diffusion"] = {"on": cal.do_diffusion, "strength": cal.diffusion_strength,
+                           "note": "disabled in streaming (not seam-free); standalone only"}
 
     # ---- HALO = max over ENABLED stages (seam-freeness depends on the LARGEST reach).
     # deconv halo is cal.halo (already set); coherence diffusion needs a MUCH bigger halo
