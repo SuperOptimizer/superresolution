@@ -85,7 +85,7 @@ def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--in", dest="inp", required=True)
     ap.add_argument("--out", dest="out", required=True)
-    ap.add_argument("--tile", type=int, default=256)
+    ap.add_argument("--tile", type=int, default=128)
     ap.add_argument("--no-deconv", action="store_true")
     ap.add_argument("--no-denoise", action="store_true")
     ap.add_argument("--diffusion", action="store_true")

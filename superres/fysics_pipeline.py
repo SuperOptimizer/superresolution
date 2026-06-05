@@ -419,11 +419,38 @@ def run_pipeline_2pass_parallel(read_region, write_region, shape, cal: Calibrati
     from concurrent.futures import ThreadPoolExecutor
     import threading
     os.environ.setdefault("OMP_NUM_THREADS", "1")
-    if workers is None:
-        workers = max(1, (os.cpu_count() or 4) - 2)
     L = lib()
     Z, Y, X = shape
     halo = cal.halo
+
+    # ---- MEMORY-BUDGETED worker count (must never OOM) ----
+    # The deconv is the RAM hog: a tile+halo FFT-pads to the next power of two and holds
+    # re+im float32 buffers + input/output copies. Estimate per-worker peak and cap the
+    # worker count to a fraction of FREE system RAM so N_workers * per_tile <= budget.
+    def _next_pow2(x):
+        p = 1
+        while p < x:
+            p *= 2
+        return p
+    pad = _next_pow2(tile + 2 * halo)
+    # deconv: re+im (2) + a couple of work copies (~3) of pad^3 float32
+    per_tile_gb = pad ** 3 * 4 * 5 / 1e9 if do_deconv else (tile + 2 * halo) ** 3 * 4 * 4 / 1e9
+    try:
+        with open("/proc/meminfo") as f:
+            free_kb = next(int(l.split()[1]) for l in f if l.startswith("MemAvailable"))
+        free_gb = free_kb / 1e6
+    except Exception:
+        free_gb = 8.0
+    budget_gb = max(2.0, 0.6 * free_gb)            # use at most 60% of available RAM
+    mem_cap = max(1, int(budget_gb / max(per_tile_gb, 0.05)))
+    core_cap = max(1, (os.cpu_count() or 4) - 2)
+    auto_workers = min(core_cap, mem_cap)
+    if workers is None:
+        workers = auto_workers
+    else:
+        # honor an explicit request but NEVER let it exceed the memory cap (no OOM)
+        workers = min(workers, mem_cap)
+    progress("workers", float(workers))
 
     # ---- PASS 1: parallel accumulate with per-worker partial state, then merge ----
     if do_normalize or do_zdrift:
