@@ -89,6 +89,7 @@ def main():
     ap.add_argument("--no-deconv", action="store_true")
     ap.add_argument("--no-denoise", action="store_true")
     ap.add_argument("--diffusion", action="store_true")
+    ap.add_argument("--workers", type=int, default=None, help="parallel tile workers (default cores-2; 1=serial)")
     args = ap.parse_args()
 
     zin = LocalZarr(args.inp, "0", "r")
@@ -113,10 +114,12 @@ def main():
         if isinstance(f, float) and time.time() - last[0] > 20:
             last[0] = time.time()
             print(f"  {p} {f*100:.0f}% {time.time()-t0:.0f}s RSS={resource.getrusage(resource.RUSAGE_SELF).ru_maxrss//1024}MB", flush=True)
-    stats = fp.run_pipeline_2pass(zin.read_region, write_region_zarr(zout), SH, cal,
-                                  tile=args.tile, do_normalize=True, do_zdrift=True,
-                                  do_deconv=not args.no_deconv, do_denoise=not args.no_denoise,
-                                  do_diffusion=args.diffusion, progress=prog)
+    runner = (fp.run_pipeline_2pass if args.workers == 1 else fp.run_pipeline_2pass_parallel)
+    kw = {} if args.workers == 1 else {"workers": args.workers}
+    stats = runner(zin.read_region, write_region_zarr(zout), SH, cal,
+                   tile=args.tile, do_normalize=True, do_zdrift=True,
+                   do_deconv=not args.no_deconv, do_denoise=not args.no_denoise,
+                   do_diffusion=args.diffusion, progress=prog, **kw)
     print(f"DONE {stats} in {time.time()-t0:.0f}s peakRSS={resource.getrusage(resource.RUSAGE_SELF).ru_maxrss//1024}MB", flush=True)
     print(f"zdrift drift_frac={getattr(cal,'zdrift_drift_frac',0):.3f} applied={cal.zdrift_factor is not None}; "
           f"norm {cal.norm_lo}/{cal.norm_hi} air={cal.air_thresh:.3f}", flush=True)

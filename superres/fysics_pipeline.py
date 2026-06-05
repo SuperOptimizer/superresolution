@@ -386,3 +386,144 @@ def run_pipeline_2pass(read_region, write_region, shape, cal: Calibration,
     return {"tiles_total": total, "tiles_processed": processed,
             "norm_lo": cal.norm_lo, "norm_hi": cal.norm_hi,
             "air_thresh": cal.air_thresh}
+
+
+# ---------------------------------------------------------------- PARALLEL (bounded)
+def _tile_coords(shape, tile):
+    Z, Y, X = shape
+    nz = -(-Z // tile); ny = -(-Y // tile); nx = -(-X // tile)
+    for iz in range(nz):
+        for iy in range(ny):
+            for ix in range(nx):
+                yield iz * tile, iy * tile, ix * tile
+
+
+def run_pipeline_2pass_parallel(read_region, write_region, shape, cal: Calibration,
+                                tile=256, workers=None, occupancy_skip=True,
+                                do_normalize=True, do_zdrift=True,
+                                do_deconv=True, do_denoise=True, do_diffusion=False,
+                                progress=lambda *_: None):
+    """Tile-PARALLEL two-pass pipeline. Same result as run_pipeline_2pass (tiles are
+    independent -> seam-free is preserved), but processes `workers` tiles concurrently.
+
+    MEMORY stays BOUNDED: peak RAM ~= workers * (one tile+halo working set). With
+    workers = cores-2 and a 256^3 tile that's a few GB, NOT volume-sized -> still
+    20TB-safe. The C kernels release the GIL during compute (pure-C ctypes calls), so
+    threads give real parallelism. Each worker forces single-threaded C (OMP=1) so we
+    parallelize over TILES, not nested threads (no oversubscription).
+
+    read_region/write_region MUST be thread-safe (concurrent calls with disjoint
+    regions). For a local/S3 zarr where each chunk is a separate file/object and tiles
+    write disjoint chunks, this holds.
+    """
+    from concurrent.futures import ThreadPoolExecutor
+    import threading
+    os.environ.setdefault("OMP_NUM_THREADS", "1")
+    if workers is None:
+        workers = max(1, (os.cpu_count() or 4) - 2)
+    L = lib()
+    Z, Y, X = shape
+    halo = cal.halo
+
+    # ---- PASS 1: parallel accumulate with per-worker partial state, then merge ----
+    if do_normalize or do_zdrift:
+        coords = list(_tile_coords(shape, tile))
+        # one state per worker thread, kept in a dict keyed by thread id so the main
+        # thread can merge them after the pool closes (threadlocal would be empty here).
+        states = {}; states_lock = threading.Lock()
+
+        def _worker_state():
+            tid = threading.get_ident()
+            st = states.get(tid)
+            if st is None:
+                st = type("S", (), {})()
+                st.hist = _HistState(); L.fy_hist_init(C.byref(st.hist))
+                st.sums = np.zeros(Z, np.float64); st.counts = np.zeros(Z, np.int64)
+                with states_lock:
+                    states[tid] = st
+            return st
+
+        def p1(coord):
+            z0, y0, x0 = coord
+            tz = min(tile, Z - z0); ty = min(tile, Y - y0); tx = min(tile, X - x0)
+            blk = read_region(z0, y0, x0, tz, ty, tx)
+            if not np.any(blk):
+                return
+            st = _worker_state()
+            u8 = np.ascontiguousarray(blk, np.uint8)
+            if do_normalize:
+                L.fy_hist_accumulate_u8(C.byref(st.hist),
+                                        u8.ctypes.data_as(C.POINTER(C.c_ubyte)), u8.size)
+            if do_zdrift:
+                f = np.ascontiguousarray(u8.astype(np.float32) / 255.0)
+                L.fy_zdrift_accumulate(f.ctypes.data_as(C.POINTER(C.c_float)),
+                                       tz, ty, tx, z0,
+                                       st.sums.ctypes.data_as(C.POINTER(C.c_double)),
+                                       st.counts.ctypes.data_as(C.POINTER(C.c_long)),
+                                       C.c_float(0.10))
+        with ThreadPoolExecutor(max_workers=workers) as ex:
+            for i, _ in enumerate(ex.map(p1, coords)):
+                progress("pass1", (i + 1) / len(coords))
+        states = list(states.values())
+        # merge per-thread states
+        merged = _HistState(); L.fy_hist_init(C.byref(merged))
+        msum = np.zeros(Z, np.float64); mcnt = np.zeros(Z, np.int64)
+        for st in states:
+            L.fy_hist_merge(C.byref(merged), C.byref(st.hist))
+            msum += st.sums; mcnt += st.counts
+        if do_normalize and merged.total > 0:
+            cal.norm_lo = int(L.fy_hist_percentile_u8(C.byref(merged), 0.5))
+            cal.norm_hi = int(L.fy_hist_percentile_u8(C.byref(merged), 99.5))
+            cal.air_thresh = float(L.fy_auto_air_thresh(C.byref(merged)))
+        if do_zdrift and mcnt.sum() > 0:
+            factor = np.zeros(Z, np.float32)
+            L.fy_zdrift_finalize(msum.ctypes.data_as(C.POINTER(C.c_double)),
+                                 mcnt.ctypes.data_as(C.POINTER(C.c_long)), Z,
+                                 factor.ctypes.data_as(C.POINTER(C.c_float)))
+            fr = float(np.nanmax(factor)) - float(np.nanmin(factor))
+            cal.zdrift_drift_frac = fr
+            cal.zdrift_factor = factor if fr >= 0.05 else None
+
+    # ---- PASS 2: parallel per-tile processing ----
+    coords = list(_tile_coords(shape, tile))
+    lo = cal.norm_lo if (do_normalize and cal.norm_lo is not None) else 0
+    hi = cal.norm_hi if (do_normalize and cal.norm_hi is not None) else 255
+    done = [0]; processed = [0]; lock = threading.Lock(); total = len(coords)
+
+    def p2(coord):
+        z0, y0, x0 = coord
+        tz = min(tile, Z - z0); ty = min(tile, Y - y0); tx = min(tile, X - x0)
+        rz0, ry0, rx0 = max(0, z0 - halo), max(0, y0 - halo), max(0, x0 - halo)
+        rz1 = min(Z, z0 + tz + halo); ry1 = min(Y, y0 + ty + halo); rx1 = min(X, x0 + tx + halo)
+        blk = read_region(rz0, ry0, rx0, rz1 - rz0, ry1 - ry0, rx1 - rx0)
+        with lock:
+            done[0] += 1; progress("pass2", done[0] / total)
+        if occupancy_skip and not np.any(blk):
+            return
+        u8 = np.ascontiguousarray(blk, np.uint8)
+        if do_normalize and cal.norm_lo is not None:
+            f = np.empty(u8.size, np.float32)
+            L.fy_norm_apply_u8(u8.ctypes.data_as(C.POINTER(C.c_ubyte)),
+                               f.ctypes.data_as(C.POINTER(C.c_float)), u8.size,
+                               C.c_ubyte(lo), C.c_ubyte(hi))
+            fcur = f.reshape(u8.shape)
+        else:
+            fcur = u8.astype(np.float32) / 255.0
+        if do_zdrift and cal.zdrift_factor is not None:
+            fcur = np.ascontiguousarray(fcur)
+            L.fy_zdrift_apply(fcur.ctypes.data_as(C.POINTER(C.c_float)),
+                              fcur.shape[0], fcur.shape[1], fcur.shape[2], rz0,
+                              cal.zdrift_factor.ctypes.data_as(C.POINTER(C.c_float)))
+        blk_corr = np.clip(fcur * 255.0 + 0.5, 0, 255).astype(np.uint8)
+        out = process_tile(blk_corr, cal, do_deconv=do_deconv,
+                           do_denoise=do_denoise, do_diffusion=do_diffusion)
+        iz0, iy0, ix0 = z0 - rz0, y0 - ry0, x0 - rx0
+        inner = out[iz0:iz0 + tz, iy0:iy0 + ty, ix0:ix0 + tx]
+        write_region(z0, y0, x0, inner)
+        with lock:
+            processed[0] += 1
+
+    with ThreadPoolExecutor(max_workers=workers) as ex:
+        list(ex.map(p2, coords))
+    return {"tiles_total": total, "tiles_processed": processed[0], "workers": workers,
+            "norm_lo": cal.norm_lo, "norm_hi": cal.norm_hi, "air_thresh": cal.air_thresh}
