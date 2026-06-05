@@ -65,6 +65,8 @@ def _load():
     lib.fy_guided_denoise.restype = C.c_int
     lib.fy_coherence_diffusion_auto.argtypes = [f32p, f32p, C.c_int, C.c_int, C.c_int, C.c_int]
     lib.fy_coherence_diffusion_auto.restype = C.c_int
+    lib.fy_coherence_diffusion_halo.argtypes = [C.c_double, C.c_double, C.c_int]
+    lib.fy_coherence_diffusion_halo.restype = C.c_int
     lib.fy_kernel_halo.argtypes = [C.POINTER(_Phys)]
     lib.fy_kernel_halo.restype = C.c_int
     # two-pass global stats
@@ -133,6 +135,8 @@ class Calibration:
         # ---- TUNED per-stage config (set by calibrate_prepass; sensible defaults) ----
         self.do_deconv = True
         self.deconv_reg = -1.0          # <=0 -> kernel auto
+        self.deconv_lo = 0.0            # GLOBAL deconv-output range for seam-safe rescale
+        self.deconv_hi = 1.0            # (measured in the pre-pass; same for every tile)
         self.do_denoise = True
         self.denoise_radius = 2
         self.do_diffusion = False
@@ -222,22 +226,23 @@ def _metric_panel(ref, out):
     legibility = (tex_o / (n_o + 1e-9)) / (tex_r / (n_r + 1e-9) + 1e-9)
     clip = float((out <= 0.001).mean() + (out >= 0.999).mean())
     finite = bool(np.isfinite(out).all())
-    # normalize each to [0,1] (1 good), roughly comparable scales:
+    # A "good" result = MORE legible (texture rises relative to noise) + texture/detail
+    # not collapsed + no clipping. Several metrics, roughly equal weight. The bucket is
+    # built so that REMOVING NOISE (which lowers raw mid-band power) is rewarded, not
+    # penalized -- the detail guard is on TEXTURE structure, not raw spectral power.
     sub = {
-        "detail_mid":  min(midret, 1.0),                    # keep texture band (cap at 1)
-        "detail_high": min(hiret, 1.0),
-        "texture":     min(tex_ratio, 1.5) / 1.5,           # more texture = better, capped
-        "denoise":     max(0.0, 1.0 - noise_ratio),         # lower noise = better
-        "legibility":  min(legibility / 2.0, 1.0),          # tex/noise gain, ~2x=full
-        "no_clip":     max(0.0, 1.0 - clip * 5.0),          # penalize clipping pile-up
+        "legibility":  min(legibility / 3.0, 1.0),          # tex/noise gain (the headline)
+        "denoise":     min(max(0.0, 1.0 - noise_ratio) / 0.5, 1.0),  # noise removed
+        "texture_keep": min(tex_ratio / 0.8, 1.0),          # keep texture (1.0 by tex_ratio>=0.8)
+        "contrast":    min(midret / 1.5, 1.0) if midret > 1 else midret,  # contrast restored (deconv)
+        "no_clip":     max(0.0, 1.0 - clip * 8.0),
     }
     score = sum(sub.values()) / len(sub) if finite else 0.0
-    # HARD CONSTRAINTS (reject regardless of score). The guard against over-smoothing is
-    # on TEXTURE retention -- real structure -- NOT raw mid-band power (which also holds
-    # the noise we legitimately remove; denoising lowers it without losing structure).
-    # Allow texture to drop modestly (a denoise removes some noise-driven "texture") but
-    # not collapse: tex_ratio >= 0.70 AND legibility must not get WORSE than the input.
-    ok = (finite and tex_ratio >= 0.70 and legibility >= 0.98 and clip < 0.06)
+    # HARD CONSTRAINTS: reject only genuinely BAD outcomes -- legibility must IMPROVE
+    # (>1.0) and texture must not COLLAPSE (tex_ratio not tiny) and no clip pile-up.
+    # This accepts processing that helps (45um forced-on: legibility 2.53->7.23) while
+    # rejecting over-smoothing (eps=0.78: texture 0.19x -> tex_ratio fails).
+    ok = (finite and legibility >= 1.05 and tex_ratio >= 0.55 and clip < 0.08)
     return {"score": score, "ok": ok, "sub": sub,
             "raw": {"midret": midret, "hiret": hiret, "noise_ratio": noise_ratio,
                     "tex_ratio": tex_ratio, "legibility": legibility, "clip": clip}}
@@ -262,10 +267,14 @@ def calibrate_prepass(md_phys: dict, sample_tiles, auto_deltabeta=True, verbose=
     cal = calibrate(md_phys, samp01, auto_deltabeta=auto_deltabeta)
     f32p = C.POINTER(C.c_float)
 
-    def deconv(v):
+    def deconv(v, rescale=True):
         a = np.ascontiguousarray(v, np.float32); o = np.empty_like(a); ph = cal.scaled_phys()
         L.fy_deconvolve(a.ctypes.data_as(f32p), o.ctypes.data_as(f32p),
                         *a.shape, C.byref(ph), C.c_double(cal.deconv_reg))
+        if rescale:  # rescale overshoot to [0,1] so scoring sees the clip-free result
+            lo, hi = np.percentile(o, 0.1), np.percentile(o, 99.9)
+            if hi - lo > 1e-6:
+                o = np.clip((o - lo) / (hi - lo), 0, 1)
         return o
     def guided(v, eps):
         a = np.ascontiguousarray(v, np.float32); o = np.empty_like(a)
@@ -307,6 +316,18 @@ def calibrate_prepass(md_phys: dict, sample_tiles, auto_deltabeta=True, verbose=
         cal.do_deconv = False; cal.deconv_reg = -1.0
     tuning["deconv"] = {"on": cal.do_deconv, "reg": cal.deconv_reg, "score": best[1], "off_score": sc_off}
 
+    # GLOBAL deconv-output rescale (seam-safe): the deconv overshoots [0,1] (e.g. the
+    # 45um volume ranges to [-0.5,1.67] -> hard-clipping destroys 47% of voxels). Measure
+    # the deconv output's robust range ONCE across the samples and rescale EVERY tile by
+    # the SAME [lo,hi] so no data is clipped AND all tiles map identically (no seams).
+    if cal.do_deconv:
+        vals = np.concatenate([deconv(t, rescale=False).ravel() for t in raw])
+        cal.deconv_lo = float(np.percentile(vals, 0.1))
+        cal.deconv_hi = float(np.percentile(vals, 99.9))
+        if cal.deconv_hi - cal.deconv_lo < 1e-6:
+            cal.deconv_lo, cal.deconv_hi = 0.0, 1.0
+        tuning["deconv"]["rescale"] = [cal.deconv_lo, cal.deconv_hi]
+
     # working set after the chosen deconv (the denoise/diffusion operate on this)
     decd = [deconv(t) if cal.do_deconv else t for t in raw]
 
@@ -338,6 +359,19 @@ def calibrate_prepass(md_phys: dict, sample_tiles, auto_deltabeta=True, verbose=
             best = (s, sc)
     cal.do_diffusion = best[0] > 0; cal.diffusion_strength = best[0] or 2
     tuning["diffusion"] = {"on": cal.do_diffusion, "strength": cal.diffusion_strength, "score": best[1]}
+
+    # ---- HALO = max over ENABLED stages (seam-freeness depends on the LARGEST reach).
+    # deconv halo is cal.halo (already set); coherence diffusion needs a MUCH bigger halo
+    # (3*sigma+3*rho+n_iters ~ 26-49 vox). Use the diffusion halo helper for a safe upper
+    # bound when diffusion is on, else the deconv halo. ----
+    halo = cal.halo
+    if cal.do_diffusion:
+        iters = {1: 12, 2: 24, 3: 40}.get(cal.diffusion_strength, 24)
+        # auto-CED uses sigma up to 1.5, rho up to 6 -> use the worst case for safety
+        dh = L.fy_coherence_diffusion_halo(1.5, 6.0, iters)
+        halo = max(halo, int(dh))
+    cal.halo = halo
+    tuning["halo"] = halo
 
     cal.tuning = tuning
     if verbose:
@@ -373,6 +407,9 @@ def process_tile(block_u8: np.ndarray, cal: Calibration,
         rc = L.fy_deconvolve(ip, op, nz, ny, nx, C.byref(ph), C.c_double(cal.deconv_reg))
         if rc != 0:
             raise RuntimeError("fy_deconvolve failed")
+        # seam-safe GLOBAL rescale of the deconv overshoot to [0,1] (don't hard-clip)
+        if cal.deconv_hi - cal.deconv_lo > 1e-6:
+            out = (out - cal.deconv_lo) / (cal.deconv_hi - cal.deconv_lo)
         cur = out
 
     if do_denoise and cal.guided_eps > 0:
