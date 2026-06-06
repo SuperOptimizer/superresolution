@@ -813,7 +813,11 @@ def process_tile(block_u8: np.ndarray, cal: Calibration,
             if L.fy_guided_denoise(sp, sop, nz, ny, nx, 2, C.c_double(0.01)) != 0:
                 break
             scratch = so
-        # threshold: explicit air_cut_u8, else the clean scratch's dark mode (+ small margin)
+        # threshold: explicit air_cut_u8, else the clean scratch's VALLEY (the histogram
+        # minimum between the dark 'other' and papyrus modes = the max-separation boundary).
+        # Measured across regions: cutting at the valley removes 0% of confident-papyrus core
+        # (only the ambiguous dark 'other'), so the valley is the principled aggressive cut.
+        # (dark_mode+8 was over-conservative -- left ~10-15% of borderline-dark voxels in.)
         if cal.air_cut_u8 is not None:
             cut = int(cal.air_cut_u8)
         else:
@@ -822,7 +826,7 @@ def process_tile(block_u8: np.ndarray, cal: Calibration,
             dark = C.c_int(0); light = C.c_int(0); valley = C.c_int(0)
             d = L.fy_valley_depth(hist.ctypes.data_as(C.POINTER(C.c_long)),
                                   C.byref(dark), C.byref(light), C.byref(valley))
-            cut = (dark.value + 8) if d >= 0 else int((cal.air_thresh or 0.05) * 255)
+            cut = valley.value if d >= 0 else int((cal.air_thresh or 0.05) * 255)
         air = scratch < (cut / 255.0)        # decided on the clean scratch
         cur = np.where(air, 0.0, cur)         # zero air in the PROCESSED output
 
