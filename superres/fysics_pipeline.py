@@ -137,15 +137,20 @@ def md_phys_from_metadata(metadata: dict) -> dict:
     proc = tomo.get("processing", {})
     phase = proc.get("preprocessing", {}).get("phase", {}) if proc else {}
     zx = metadata.get("zarr_export", {})
+    # coalesce: use the default when the key is MISSING **or present-but-None** (incomplete
+    # metadata). dict.get(k, default) only covers missing keys, not null values.
+    def g(d, k, default):
+        val = d.get(k, None)
+        return default if val is None else val
     # samplePixelSize is in mm in the ESRF metadata -> convert to um
-    px_mm = det.get("samplePixelSize")
+    px_mm = g(det, "samplePixelSize", None)
     md = {
-        "energy_kev": float(acq.get("energy", 78.0)),
-        "distance_mm": float(acq.get("sampleDetectorDistance", 220.0)),
+        "energy_kev": float(g(acq, "energy", 78.0)),
+        "distance_mm": float(g(acq, "sampleDetectorDistance", 220.0)),
         "pixel_um": float(px_mm * 1000.0) if px_mm else 2.4,
-        "delta_beta": float(phase.get("delta_beta", 1000.0)),
-        "unsharp_sigma": float(phase.get("unsharp_sigma", 1.2)),
-        "unsharp_coeff": float(phase.get("unsharp_coeff", 4.0)),
+        "delta_beta": float(g(phase, "delta_beta", 1000.0)),
+        "unsharp_sigma": float(g(phase, "unsharp_sigma", 1.2)),
+        "unsharp_coeff": float(g(phase, "unsharp_coeff", 4.0)),
         "phase_method": phase.get("method"),
         # beam-current drift over the scan (used to gate z-drift correction)
         "machine_current_start": acq.get("machineCurrentStart"),
