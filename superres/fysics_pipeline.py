@@ -747,12 +747,15 @@ def process_tile(block_u8: np.ndarray, cal: Calibration,
     # denoise detail (the scratch smoothing is discarded). Threshold from the clean scratch's
     # dark mode (or cal.air_cut_u8). Validated 128^3: papyrus texture preserved, near-0 specks.
     if cal.do_air_zero:
+        # SCRATCH denoise to decide the mask. Use the GUIDED filter (O(N) box-based), NOT
+        # bilateral: guided x5 is ~28x faster (0.7s vs 20s/128^3) and finds the SAME dark
+        # mode (u8 53), which is all the threshold needs. The scratch is discarded -- only
+        # the mask DECISION matters, so guided's slightly shallower valley is irrelevant.
         scratch = orig.copy()
         for _ in range(int(cal.scratch_passes)):
             si, sp = _fp(scratch)
             so = np.empty_like(si); sop = so.ctypes.data_as(C.POINTER(C.c_float))
-            if L.fy_bilateral_denoise(sp, sop, nz, ny, nx,
-                                      C.c_double(2.0), C.c_double(0.04), 3) != 0:
+            if L.fy_guided_denoise(sp, sop, nz, ny, nx, 2, C.c_double(0.01)) != 0:
                 break
             scratch = so
         # threshold: explicit air_cut_u8, else the clean scratch's dark mode (+ small margin)
