@@ -105,16 +105,14 @@ def main():
                    pixel_um=a.get("detector", {}).get("samplePixelSize", 0.045532) * 1000,
                    unsharp_sigma=ph.get("unsharp_sigma", 1.2), unsharp_coeff=ph.get("unsharp_coeff", 4.0))
     print("beam mA:", a.get("machineCurrentStart"), "->", a.get("machineCurrentStop"), flush=True)
-    # calibration PRE-PASS: sample a few textured tiles, tune the whole chain across
-    # a bucket of metrics (resolution-adaptive; turns off stages that can't help).
-    samples = []
-    for (sz, sy, sx) in [(SH[0]//2, SH[1]//2, SH[2]//2), (SH[0]//2, SH[1]//3, SH[2]//2),
-                         (SH[0]//3, SH[1]//2, SH[2]//3), (2*SH[0]//3, SH[1]//2, SH[2]//2)]:
-        t = zin.read_region(sz, sy, sx, 128, 128, 128)
-        if t.std() > 20 and (t > 20).mean() > 0.5:
-            samples.append(t)
+    # calibration PRE-PASS: SMART-SAMPLE the most textured/representative tiles, then tune
+    # the whole chain (joint deconv x denoise search) across a bucket of metrics
+    # (resolution-adaptive; turns off stages that can't help, and explains why).
+    read = lambda zz, yy, xx, dz, dy, dx: zin.read_region(zz, yy, xx, dz, dy, dx)
+    samples = fp.select_sample_tiles(read, SH, n=6, tile=128, candidates=27)
     if not samples:
         samples = [zin.read_region(SH[0]//2, SH[1]//2, SH[2]//2, 128, 128, 128)]
+    print(f"smart-sampled {len(samples)} textured tiles (means={[int(s.mean()) for s in samples]})", flush=True)
     cal = fp.calibrate_prepass(md_phys, samples, verbose=True)
     print(f"calib db_scale={cal.db_scale:.2f} noise_ref={cal.noise_ref:.4f} eps={cal.guided_eps:.4f} halo={cal.halo}", flush=True)
 
