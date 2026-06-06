@@ -81,6 +81,13 @@ def _load():
     lib.fy_papyrus_mask.argtypes = [f32p, f32p, C.c_int, C.c_int, C.c_int,
                                     C.c_float, C.c_float, C.c_float, C.c_float, C.c_int]
     lib.fy_papyrus_mask.restype = C.c_int
+    # bilateral (used for the throwaway-mask scratch denoise) + histogram metrics
+    lib.fy_bilateral_denoise.argtypes = [f32p, f32p, C.c_int, C.c_int, C.c_int,
+                                         C.c_double, C.c_double, C.c_int]
+    lib.fy_bilateral_denoise.restype = C.c_int
+    lib.fy_valley_depth.argtypes = [C.POINTER(C.c_long), C.POINTER(C.c_int),
+                                    C.POINTER(C.c_int), C.POINTER(C.c_int)]
+    lib.fy_valley_depth.restype = C.c_double
     lib.fy_apply_mask.argtypes = [f32p, f32p, f32p, f32p,
                                   C.c_int, C.c_int, C.c_int, C.c_float]
     lib.fy_apply_mask.restype = C.c_int
@@ -144,6 +151,18 @@ def md_phys_from_metadata(metadata: dict) -> dict:
         "window_f32_max": (float(zx["target_window_f32_max"])
                            if "target_window_f32_max" in zx else None),
     }
+    # RECON-MEASURED physical distribution (nabu's own histogram, pre-windowing) -- the REAL
+    # air/material range, better than the nominal window for a physics-derived class boundary.
+    h32 = proc.get("32bitsData", {}).get("histogram", {}) if proc else {}
+    if h32:
+        md["recon_air_floor"] = h32.get("min_0p002_percentile")        # ~0 = air baseline
+        md["recon_material_p998"] = h32.get("max_0p998_percentile")    # densest material
+    conv = proc.get("postprocessing", {}).get("32BitsConversion", {}) if proc else {}
+    if conv:
+        md["recon_used_min"] = conv.get("dataset_used_min")
+        md["recon_used_max"] = conv.get("dataset_used_max")
+    # reconstruction method (GHBP != generic FBP -> its filter has its own transfer fn)
+    md["recon_method"] = proc.get("reconstruction", {}).get("method") if proc else None
     return md
 
 
@@ -231,6 +250,14 @@ class Calibration:
         self.denoise_radius = 2
         self.do_diffusion = False
         self.diffusion_strength = 2
+        # ---- AIR-ZERO (throwaway-mask) config ----
+        # Validated air separation: denoise a SCRATCH copy (iterated gentle bilateral) to
+        # decide the air/papyrus mask, then ZERO air in the processed output (papyrus keeps
+        # full processing). air_cut_u8 = the threshold on the scratch (set from the clean
+        # scratch's fitted dark mode, dark_mu+0.5sigma); scratch_passes = bilateral iterations.
+        self.do_air_zero = False
+        self.air_cut_u8 = None        # u8 threshold on the denoised scratch (None -> derive)
+        self.scratch_passes = 5
         self.tuning = {}                # per-stage chosen value + metric panel (for inspection)
 
     def scaled_phys(self) -> _Phys:
@@ -687,6 +714,13 @@ def process_tile(block_u8: np.ndarray, cal: Calibration,
         # seam-safe GLOBAL rescale of the deconv overshoot to [0,1] (don't hard-clip)
         if cal.deconv_hi - cal.deconv_lo > 1e-6:
             out = (out - cal.deconv_lo) / (cal.deconv_hi - cal.deconv_lo)
+        # NOTE: the export window-clips the u8 (saturated material -> 255, masked/below-window
+        # -> 0). Those rails are not true intensities, and deconv rings against the clipped
+        # plateau edge (~50% of voxels in the 3-vox ring around a saturated voxel overshoot to
+        # >0.99, vs 0.01% far away). MEASURED but NOT guarded: it touches only ~0.05% of voxels,
+        # and a clean fix needs clip-inpainting before deconv (not a local cap -- the local
+        # values are themselves railed, so any cap is a no-op in the ring). Documented as a
+        # known limitation in memory [[zarr-export-baked-processing]] rather than half-fixed.
         cur = out
 
     if do_denoise and cal.guided_eps > 0:
@@ -705,27 +739,34 @@ def process_tile(block_u8: np.ndarray, cal: Calibration,
             raise RuntimeError("fy_coherence_diffusion_auto failed")
         cur = out
 
-    # AIR MASK: keep the processed result on papyrus, leave air as the original (no
-    # amplified noise in empty gaps). Mask from the ORIGINAL tile; blend processed<-orig.
-    if do_mask and (do_deconv or do_denoise or do_diffusion) and cal.air_thresh is not None:
-        oi, op_ = _fp(orig)
-        mask = np.empty_like(oi); mp = mask.ctypes.data_as(C.POINTER(C.c_float))
-        # intensity gate from the Otsu air thresh; var gate is auto (lo<=hi -> kernel default)
-        # ramp the mask 0->1 across [0.5*thr, thr]: anything at/above the air threshold is
-        # fully papyrus (mask=1, untouched). Keeping intensity_hi AT thr (not 1.4*thr) is
-        # important -- a higher upper bound bleeds the mask into dark-but-real papyrus
-        # (fiber gaps) and would partly UNDO the deconv there. air-only suppression.
-        thr = float(cal.air_thresh)
-        rc = L.fy_papyrus_mask(op_, mp, nz, ny, nx,
-                               C.c_float(thr * 0.5), C.c_float(thr),
-                               C.c_float(0.0), C.c_float(0.0), 2)
-        if rc == 0:
-            proc, pp = _fp(cur)
-            out = np.empty_like(proc); ob = out.ctypes.data_as(C.POINTER(C.c_float))
-            # air_fill < 0 -> use the original tile's value in air (preserve, don't blank)
-            rc2 = L.fy_apply_mask(pp, op_, mp, ob, nz, ny, nx, C.c_float(-1.0))
-            if rc2 == 0:
-                cur = out
+    # AIR-ZERO (throwaway-mask). Air noise and papyrus fiber texture are spectrally
+    # ENTANGLED (validated: texture Fisher ~0), so no denoiser separates them on the kept
+    # data without destroying papyrus. The fix: denoise a SCRATCH copy (iterated gentle
+    # bilateral -- deepens the air|papyrus histogram valley, de-saturates) ONLY to DECIDE
+    # the mask, then ZERO air in the PROCESSED output. The kept papyrus keeps full deconv+
+    # denoise detail (the scratch smoothing is discarded). Threshold from the clean scratch's
+    # dark mode (or cal.air_cut_u8). Validated 128^3: papyrus texture preserved, near-0 specks.
+    if cal.do_air_zero:
+        scratch = orig.copy()
+        for _ in range(int(cal.scratch_passes)):
+            si, sp = _fp(scratch)
+            so = np.empty_like(si); sop = so.ctypes.data_as(C.POINTER(C.c_float))
+            if L.fy_bilateral_denoise(sp, sop, nz, ny, nx,
+                                      C.c_double(2.0), C.c_double(0.04), 3) != 0:
+                break
+            scratch = so
+        # threshold: explicit air_cut_u8, else the clean scratch's dark mode (+ small margin)
+        if cal.air_cut_u8 is not None:
+            cut = int(cal.air_cut_u8)
+        else:
+            su8 = np.ascontiguousarray(np.clip(scratch * 255 + 0.5, 0, 255).astype(np.uint8))
+            hist = np.bincount(su8.ravel(), minlength=256).astype(np.int64)
+            dark = C.c_int(0); light = C.c_int(0); valley = C.c_int(0)
+            d = L.fy_valley_depth(hist.ctypes.data_as(C.POINTER(C.c_long)),
+                                  C.byref(dark), C.byref(light), C.byref(valley))
+            cut = (dark.value + 8) if d >= 0 else int((cal.air_thresh or 0.05) * 255)
+        air = scratch < (cut / 255.0)        # decided on the clean scratch
+        cur = np.where(air, 0.0, cur)         # zero air in the PROCESSED output
 
     # back to u8
     cur = np.clip(cur * 255.0 + 0.5, 0, 255).astype(np.uint8)
