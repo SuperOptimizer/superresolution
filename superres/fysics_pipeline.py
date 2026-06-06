@@ -88,6 +88,12 @@ def _load():
     lib.fy_valley_depth.argtypes = [C.POINTER(C.c_long), C.POINTER(C.c_int),
                                     C.POINTER(C.c_int), C.POINTER(C.c_int)]
     lib.fy_valley_depth.restype = C.c_double
+    # whole-chain quality metrics (used to reconcile the calibration objective with the
+    # validated quality basket: noise floor, edge/sheet sharpness)
+    lib.fy_edge_sharpness.argtypes = [f32p, C.c_int, C.c_int, C.c_int]
+    lib.fy_edge_sharpness.restype = C.c_double
+    lib.fy_flat_noise.argtypes = [f32p, C.c_int, C.c_int, C.c_int, C.c_int]
+    lib.fy_flat_noise.restype = C.c_double
     lib.fy_apply_mask.argtypes = [f32p, f32p, f32p, f32p,
                                   C.c_int, C.c_int, C.c_int, C.c_float]
     lib.fy_apply_mask.restype = C.c_int
@@ -494,6 +500,39 @@ def calibrate_prepass(md_phys: dict, sample_tiles, auto_deltabeta=True, verbose=
         L.fy_coherence_diffusion_auto(a.ctypes.data_as(f32p), o.ctypes.data_as(f32p), *a.shape, int(s))
         return o
 
+    # ---- WHOLE-CHAIN QUALITY BASKET helpers (C-backed; reconciles the calibration objective
+    #      with the validated quality basket -- noise floor & sheet sharpness, in physical
+    #      units the basket uses). See [[whole-pipeline-validation]]. ----
+    def _edge_sharp(v):
+        a = np.ascontiguousarray(v, np.float32)
+        return float(L.fy_edge_sharpness(a.ctypes.data_as(f32p), *a.shape))
+    def _flat_noise(v):
+        a = np.ascontiguousarray(v, np.float32)
+        return float(L.fy_flat_noise(a.ctypes.data_as(f32p), *a.shape, 8))
+    def _midband(v):
+        from numpy.fft import fftn, fftshift
+        x = v - v.mean(); F = np.abs(fftshift(fftn(x))) ** 2; n = v.shape[0]; c = n // 2
+        z, y, xx = np.indices(v.shape) - c; r = np.sqrt(z*z + y*y + xx*xx).astype(int)
+        rp = (np.bincount(r.ravel(), F.ravel()) / np.maximum(np.bincount(r.ravel()), 1))[:c]
+        nyq = len(rp) - 1; return rp[int(0.17*nyq):int(0.5*nyq)].sum() + 1e-12
+    # per-tile raw references for the quality ratios (computed once)
+    _raw_noise = [_flat_noise(t) for t in raw]
+    _raw_sharp = [_edge_sharp(t) for t in raw]
+    _raw_mid = [_midband(t) for t in raw]
+    def quality_basket(out_tiles):
+        """Validated whole-chain quality score over the sample tiles. Returns (score, ok):
+        HARD CONSTRAINTS noise<=1.05*raw (deconv amplification undone) AND sharp>=0.98*raw
+        (not net-blurred); OBJECTIVE = mean mid-band contrast ratio (maximize). Mirrors the
+        constrained joint tune that picked reg=0.15/eps~0.004 over the over-denoised 0.009."""
+        noises, sharps, contrs = [], [], []
+        for i, o in enumerate(out_tiles):
+            noises.append(_flat_noise(o) / (_raw_noise[i] + 1e-9))
+            sharps.append(_edge_sharp(o) / (_raw_sharp[i] + 1e-9))
+            contrs.append(_midband(o) / (_raw_mid[i] + 1e-9))
+        noise = float(np.median(noises)); sharp = float(np.median(sharps)); contr = float(np.median(contrs))
+        ok = (noise <= 1.05 and sharp >= 0.98)
+        return contr, ok, dict(noise=noise, sharp=sharp, contrast=contr)
+
     tuning = {}
 
     # ---------- JOINT (deconv reg x denoise eps) search over the full chain ----------
@@ -505,17 +544,29 @@ def calibrate_prepass(md_phys: dict, sample_tiles, auto_deltabeta=True, verbose=
     # one reference-PSD/texture/noise cache per tile (ref = raw[ti], constant across cells)
     _ref_caches = [{} for _ in raw]
     def chain_score(reg, eps):
-        """End-to-end panel score (mean over tiles) for the (reg, eps) chain vs RAW ref."""
-        per = []
+        """End-to-end score for the (reg, eps) chain. RECONCILED with the validated whole-chain
+        quality basket: the OBJECTIVE is the quality basket's mid-band contrast (maximize), and
+        a candidate is `ok` only if it passes BOTH the panel's safety constraints (legibility,
+        texture-not-collapsed, no clip) AND the basket's quality constraints (noise<=raw,
+        sharp>=raw). This stops the old over-denoising: panel-alone rewarded noise reduction and
+        picked eps~0.009 (net-blur); the basket constraint rejects net-blur -> picks eps~0.004-5."""
+        outs, per = [], []
         for ti in range(len(raw)):
             cur = raw[ti]
             if reg is not None:
                 cur = rescale01(deconv_raw(ti, reg))
             if eps > 0:
                 cur = guided(cur, eps)
+            outs.append(cur)
             per.append(_metric_panel(raw[ti], cur, ref_cache=_ref_caches[ti]))
-        sc = float(np.mean([m["score"] for m in per]))
-        ok = all(m["ok"] for m in per)
+        panel_ok = all(m["ok"] for m in per)
+        contr, basket_ok, qm = quality_basket(outs)
+        # objective = quality-basket contrast (the validated thing to maximize);
+        # ok = panel safety AND basket quality (noise<=raw, sharp>=raw).
+        sc = contr
+        ok = panel_ok and basket_ok
+        for m in per:
+            m["quality"] = qm
         return sc, ok, per
 
     # COARSE-TO-FINE joint search (cheaper than the full REGxEPS grid while still JOINT):
