@@ -386,7 +386,13 @@ def _metric_panel(ref, out, ref_cache=None):
     # This accepts processing that helps (45um forced-on: legibility 2.53->7.23) while
     # rejecting over-smoothing (eps=0.78: texture 0.19x -> tex_ratio fails).
     ok = (finite and legibility >= 1.05 and tex_ratio >= 0.55 and clip < 0.08)
-    return {"score": score, "ok": ok, "sub": sub,
+    # SAFETY-only subset (finite + no clip pile-up + texture not OBLITERATED): used by the
+    # quality-basket-reconciled joint search, which owns the QUALITY decision. The full `ok`
+    # above (legibility>=1.05, tex>=0.55) is the legacy quality gate -- too strict for coarse
+    # volumes (45um: legibility 1.04<1.05 rejected everything -> all OFF). The basket decides
+    # quality; the panel only vetoes genuinely unsafe output here.
+    safe = (finite and clip < 0.08 and tex_ratio >= 0.30)
+    return {"score": score, "ok": ok, "safe": safe, "sub": sub,
             "raw": {"midret": midret, "hiret": hiret, "noise_ratio": noise_ratio,
                     "tex_ratio": tex_ratio, "legibility": legibility, "clip": clip}}
 
@@ -530,8 +536,17 @@ def calibrate_prepass(md_phys: dict, sample_tiles, auto_deltabeta=True, verbose=
             sharps.append(_edge_sharp(o) / (_raw_sharp[i] + 1e-9))
             contrs.append(_midband(o) / (_raw_mid[i] + 1e-9))
         noise = float(np.median(noises)); sharp = float(np.median(sharps)); contr = float(np.median(contrs))
-        ok = (noise <= 1.05 and sharp >= 0.98)
-        return contr, ok, dict(noise=noise, sharp=sharp, contrast=contr)
+        # CONSTRAINTS (resolution-robust, multi-source validated 1.1-45um). Two failure modes
+        # to avoid: (a) hard noise<=raw rejected good deconv on fine/noisy AND coarse volumes
+        # (-> everything OFF); (b) pure legibility>=1 let deconv-ONLY win everywhere (noise
+        # 1.76x, no denoise). Balance: deconv may amplify noise, but only PROPORTIONAL to the
+        # contrast it buys -- noise ceiling = 1 + 0.5*(contrast-1), capped at 2.0. Reject net-
+        # blur (sharp<0.95). OBJECTIVE (caller) = legibility (contrast/noise), so among passing
+        # cells it PREFERS the denoised one (controls noise) over noisy deconv-only.
+        noise_ceiling = min(1.0 + 0.5 * max(contr - 1.0, 0.0), 2.0)
+        legibility = contr / max(noise, 1e-6)
+        ok = (sharp >= 0.95 and noise <= noise_ceiling and contr >= 1.0)
+        return legibility, ok, dict(noise=noise, sharp=sharp, contrast=contr, legibility=legibility)
 
     tuning = {}
 
@@ -559,12 +574,11 @@ def calibrate_prepass(md_phys: dict, sample_tiles, auto_deltabeta=True, verbose=
                 cur = guided(cur, eps)
             outs.append(cur)
             per.append(_metric_panel(raw[ti], cur, ref_cache=_ref_caches[ti]))
-        panel_ok = all(m["ok"] for m in per)
-        contr, basket_ok, qm = quality_basket(outs)
-        # objective = quality-basket contrast (the validated thing to maximize);
-        # ok = panel safety AND basket quality (noise<=raw, sharp>=raw).
-        sc = contr
-        ok = panel_ok and basket_ok
+        panel_safe = all(m["safe"] for m in per)   # safety only (finite/no-clip/tex-not-gone)
+        sc, basket_ok, qm = quality_basket(outs)    # quality OWNED by the basket; sc=legibility
+        # ok = panel SAFETY (not the legacy quality floor) AND basket quality. The basket's
+        # contrast/noise/sharp constraints make the quality call; the panel only vetoes unsafe.
+        ok = panel_safe and basket_ok
         for m in per:
             m["quality"] = qm
         return sc, ok, per
