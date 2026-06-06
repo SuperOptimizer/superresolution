@@ -876,6 +876,38 @@ def calibrate_for_volume(metadata: dict, sample_chunk_u8: np.ndarray) -> Calibra
     return cal
 
 
+def preprocess_volume(read_region, write_region, shape, metadata: dict, sample_tiles,
+                      tile=128, do_air_zero=True, scratch_passes=5,
+                      do_normalize=False, do_zdrift=False, progress=lambda *_: None):
+    """WHOLE-VOLUME preprocessing the RIGHT way: GLOBAL calibration + 2-pass, NOT per-chunk.
+
+    This is the fix for per-chunk inconsistency (a per-128^3 air valley / calibration varies
+    chunk-to-chunk and zeros real papyrus on dense chunks). Flow:
+      0. calibrate the CHAIN ONCE on representative whole-volume `sample_tiles` (reg/eps/
+         deconv-rescale from many chunks, not one) -> consistent deconv/denoise everywhere.
+      1. PASS 1 (accumulate_global_stats): stream the volume -> ONE global air cut (from the
+         whole-volume scratch histogram), + optional global normalization + z-drift profile.
+      2. PASS 2: per tile, halo-padded, local deconv/denoise/air-zero using the GLOBAL values.
+    `sample_tiles` = list of representative occupied u8 chunks (use select_sample_tiles()).
+    """
+    md = md_phys_from_metadata(metadata)
+    cal = calibrate_prepass(md, [np.ascontiguousarray(t, np.uint8) for t in sample_tiles],
+                            verbose=False)
+    cal.air_thresh = air_thresh_from_physics(md)
+    cal.do_air_zero = do_air_zero and (cal.air_thresh is not None)
+    cal.scratch_passes = scratch_passes
+    progress("calibrated", 0.0)
+    # PASS 1: global stats (global air cut + optional normalize/zdrift)
+    accumulate_global_stats(read_region, shape, cal, tile=max(tile, 256),
+                            want_norm=do_normalize, want_zdrift=do_zdrift,
+                            want_air_cut=cal.do_air_zero, progress=progress)
+    progress("pass1_done", float(cal.air_cut_u8 or 0))
+    # PASS 2: local processing with global values
+    return run_pipeline(read_region, write_region, shape, cal, tile=tile,
+                        do_deconv=cal.do_deconv, do_denoise=cal.do_denoise,
+                        do_diffusion=False, progress=progress), cal
+
+
 def preprocess_chunk(chunk_u8: np.ndarray, cal: Calibration) -> np.ndarray:
     """Preprocess ONE chunk (e.g. vc3d's bare 32^3) -> u8. Interactive: ~3-8ms per 32^3.
 
