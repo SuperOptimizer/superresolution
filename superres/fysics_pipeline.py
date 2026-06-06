@@ -77,6 +77,13 @@ def _load():
     lib.fy_norm_apply_u8.argtypes = [u8p, f32p, C.c_size_t, C.c_ubyte, C.c_ubyte]
     lib.fy_auto_air_thresh.argtypes = [C.POINTER(_HistState)]
     lib.fy_auto_air_thresh.restype = C.c_float
+    # papyrus/air masking (keep sharpening on papyrus; leave air flat)
+    lib.fy_papyrus_mask.argtypes = [f32p, f32p, C.c_int, C.c_int, C.c_int,
+                                    C.c_float, C.c_float, C.c_float, C.c_float, C.c_int]
+    lib.fy_papyrus_mask.restype = C.c_int
+    lib.fy_apply_mask.argtypes = [f32p, f32p, f32p, f32p,
+                                  C.c_int, C.c_int, C.c_int, C.c_float]
+    lib.fy_apply_mask.restype = C.c_int
     # z-drift (shading / beam-current decay across z)
     dp = C.POINTER(C.c_double); lp = C.POINTER(C.c_long); fp_ = C.POINTER(C.c_float)
     lib.fy_zdrift_accumulate.argtypes = [f32p, C.c_int, C.c_int, C.c_int, C.c_int, dp, lp, C.c_float]
@@ -116,6 +123,7 @@ def md_phys_from_metadata(metadata: dict) -> dict:
     det = acq.get("detector", {})
     proc = tomo.get("processing", {})
     phase = proc.get("preprocessing", {}).get("phase", {}) if proc else {}
+    zx = metadata.get("zarr_export", {})
     # samplePixelSize is in mm in the ESRF metadata -> convert to um
     px_mm = det.get("samplePixelSize")
     md = {
@@ -129,8 +137,35 @@ def md_phys_from_metadata(metadata: dict) -> dict:
         # beam-current drift over the scan (used to gate z-drift correction)
         "machine_current_start": acq.get("machineCurrentStart"),
         "machine_current_stop": acq.get("machineCurrentStop"),
+        # u8 export window (physical units): u8 = 255*(mu - wlo)/(whi - wlo). This is the
+        # KEY to a physics-derived air threshold -- air's attenuation ~= the window floor.
+        "window_f32_min": (float(zx["target_window_f32_min"])
+                           if "target_window_f32_min" in zx else None),
+        "window_f32_max": (float(zx["target_window_f32_max"])
+                           if "target_window_f32_max" in zx else None),
     }
     return md
+
+
+def air_thresh_from_physics(md_phys: dict) -> float | None:
+    """Physics-derived air threshold in [0,1] (u8/255), or None if the window is unknown.
+
+    The u8 export maps physical attenuation mu linearly: u8 = 255*(mu - wlo)/(whi - wlo),
+    with (wlo, whi) = the metadata zarr_export window. Air's linear attenuation is ~0, and
+    the window FLOOR (wlo) is set right at the air/material baseline -- so air clips to the
+    very bottom of the u8 range. The air/papyrus boundary sits a small margin above the
+    floor. We place the threshold a few percent of the window span above the floor.
+
+    This is principled where Otsu is NOT: Otsu on a mostly-material tile finds a within-
+    papyrus split (measured: u8 93 on a dense corner, deep inside papyrus -> would mask
+    real papyrus as air). The physics value is ~u8 5-15 (just above the air baseline)."""
+    wlo, whi = md_phys.get("window_f32_min"), md_phys.get("window_f32_max")
+    if wlo is None or whi is None or whi <= wlo:
+        return None
+    # air sits at the floor; the boundary to material is a small margin up the window span.
+    # 5% of span above the floor is comfortably above air noise yet far below papyrus bulk.
+    frac_air = 0.05
+    return float(frac_air)  # since u8 = span_frac, and floor maps to 0 -> thresh = frac
 
 
 def load_md_phys(zarr_root: str, backend=None) -> dict:
@@ -184,7 +219,8 @@ class Calibration:
         # ---- whole-volume stats (set by the pass-1 finalize; None until then) ----
         self.norm_lo = norm_lo        # u8 lo for global normalization
         self.norm_hi = norm_hi        # u8 hi for global normalization
-        self.air_thresh = air_thresh  # Otsu air threshold [0,1]
+        self.air_thresh = air_thresh  # air threshold [0,1] (physics-derived preferred)
+        self.air_thresh_physics = None  # set by calibrate() from the export window
         self.zdrift_factor = zdrift_factor  # per-z correction factor array (float32)
         # ---- TUNED per-stage config (set by calibrate_prepass; sensible defaults) ----
         self.do_deconv = True
@@ -236,8 +272,12 @@ def calibrate(md_phys: dict, sample_chunks, window=None,
     POST_DECONV_NOISE_GAIN = 3.5
     guided_eps_raw = L.fy_guided_eps_for_noise(noise_ref)
     guided_eps = L.fy_guided_eps_for_noise(noise_ref * POST_DECONV_NOISE_GAIN)
-    return Calibration(phys, db_scale, noise_ref, guided_eps, halo, window,
-                       guided_eps_raw=guided_eps_raw)
+    cal = Calibration(phys, db_scale, noise_ref, guided_eps, halo, window,
+                      guided_eps_raw=guided_eps_raw)
+    # PHYSICS-DERIVED air threshold from the export window (preferred over Otsu, which on a
+    # mostly-material tile finds a within-papyrus split). None if the window is unknown.
+    cal.air_thresh_physics = air_thresh_from_physics(md_phys)
+    return cal
 
 
 # ---------------------------------------------------------------- the per-tile chain
@@ -611,13 +651,19 @@ def calibrate_prepass(md_phys: dict, sample_tiles, auto_deltabeta=True, verbose=
 
 def process_tile(block_u8: np.ndarray, cal: Calibration,
                  do_deconv=None, do_denoise=None, do_diffusion=None,
-                 diffusion_strength=None) -> np.ndarray:
+                 diffusion_strength=None, do_mask=None) -> np.ndarray:
     """Run the full chain on one tile (with halo). Input/output uint8.
 
-    Order: u8 -> [phys] -> deconv -> denoise -> [diffusion] -> u8. The per-stage on/off
-    and STRENGTHS come from the (calibrated) `cal` by default -- pass explicit args only
-    to override. The HALO is part of block_u8; the caller crops the inner tile after.
-    """
+    Order: u8 -> [phys] -> deconv -> denoise -> [diffusion] -> [air-mask] -> u8. The
+    per-stage on/off and STRENGTHS come from the (calibrated) `cal` by default -- pass
+    explicit args only to override. The HALO is part of block_u8; the caller crops the
+    inner tile after.
+
+    AIR MASKING (do_mask): papyrus is bright+textured, air is dark+flat. After processing,
+    blend the PROCESSED result on papyrus with the ORIGINAL (un-sharpened) tile in air, so
+    deconv/denoise don't amplify noise in empty gaps. Gated on cal.air_thresh (set by the
+    pass-1 finalize); the mask is built per-tile and is local (radius-bounded) so it stays
+    seam-safe. Default ON whenever an air threshold is available."""
     L = lib()
     nz, ny, nx = block_u8.shape
     # use the TUNED config unless explicitly overridden
@@ -625,8 +671,11 @@ def process_tile(block_u8: np.ndarray, cal: Calibration,
     do_denoise = cal.do_denoise if do_denoise is None else do_denoise
     do_diffusion = cal.do_diffusion if do_diffusion is None else do_diffusion
     diffusion_strength = cal.diffusion_strength if diffusion_strength is None else diffusion_strength
+    if do_mask is None:
+        do_mask = cal.air_thresh is not None
 
-    cur = (block_u8.astype(np.float32) / 255.0)
+    orig = (block_u8.astype(np.float32) / 255.0)   # keep for the air blend
+    cur = orig
 
     if do_deconv:
         inp, ip = _fp(cur)
@@ -655,6 +704,28 @@ def process_tile(block_u8: np.ndarray, cal: Calibration,
         if rc != 0:
             raise RuntimeError("fy_coherence_diffusion_auto failed")
         cur = out
+
+    # AIR MASK: keep the processed result on papyrus, leave air as the original (no
+    # amplified noise in empty gaps). Mask from the ORIGINAL tile; blend processed<-orig.
+    if do_mask and (do_deconv or do_denoise or do_diffusion) and cal.air_thresh is not None:
+        oi, op_ = _fp(orig)
+        mask = np.empty_like(oi); mp = mask.ctypes.data_as(C.POINTER(C.c_float))
+        # intensity gate from the Otsu air thresh; var gate is auto (lo<=hi -> kernel default)
+        # ramp the mask 0->1 across [0.5*thr, thr]: anything at/above the air threshold is
+        # fully papyrus (mask=1, untouched). Keeping intensity_hi AT thr (not 1.4*thr) is
+        # important -- a higher upper bound bleeds the mask into dark-but-real papyrus
+        # (fiber gaps) and would partly UNDO the deconv there. air-only suppression.
+        thr = float(cal.air_thresh)
+        rc = L.fy_papyrus_mask(op_, mp, nz, ny, nx,
+                               C.c_float(thr * 0.5), C.c_float(thr),
+                               C.c_float(0.0), C.c_float(0.0), 2)
+        if rc == 0:
+            proc, pp = _fp(cur)
+            out = np.empty_like(proc); ob = out.ctypes.data_as(C.POINTER(C.c_float))
+            # air_fill < 0 -> use the original tile's value in air (preserve, don't blank)
+            rc2 = L.fy_apply_mask(pp, op_, mp, ob, nz, ny, nx, C.c_float(-1.0))
+            if rc2 == 0:
+                cur = out
 
     # back to u8
     cur = np.clip(cur * 255.0 + 0.5, 0, 255).astype(np.uint8)
@@ -743,7 +814,8 @@ def accumulate_global_stats(read_region, shape, cal: Calibration, tile=256,
     if want_norm and hist.total > 0:
         cal.norm_lo = int(L.fy_hist_percentile_u8(C.byref(hist), norm_lo_pct))
         cal.norm_hi = int(L.fy_hist_percentile_u8(C.byref(hist), norm_hi_pct))
-        cal.air_thresh = float(L.fy_auto_air_thresh(C.byref(hist)))
+        cal.air_thresh = (cal.air_thresh_physics if cal.air_thresh_physics is not None
+                          else float(L.fy_auto_air_thresh(C.byref(hist))))
     if want_zdrift and counts.sum() > 0:
         factor = np.zeros(Z, np.float32)
         L.fy_zdrift_finalize(sums_p, counts_p, Z,
@@ -939,7 +1011,8 @@ def run_pipeline_2pass_parallel(read_region, write_region, shape, cal: Calibrati
         if do_normalize and merged.total > 0:
             cal.norm_lo = int(L.fy_hist_percentile_u8(C.byref(merged), 0.5))
             cal.norm_hi = int(L.fy_hist_percentile_u8(C.byref(merged), 99.5))
-            cal.air_thresh = float(L.fy_auto_air_thresh(C.byref(merged)))
+            cal.air_thresh = (cal.air_thresh_physics if cal.air_thresh_physics is not None
+                              else float(L.fy_auto_air_thresh(C.byref(merged))))
         if do_zdrift and mcnt.sum() > 0:
             factor = np.zeros(Z, np.float32)
             L.fy_zdrift_finalize(msum.ctypes.data_as(C.POINTER(C.c_double)),
