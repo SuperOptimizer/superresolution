@@ -99,6 +99,60 @@ def _fp(a):  # float32 contiguous -> c_float*
 
 
 # ---------------------------------------------------------------- physics from metadata
+def md_phys_from_metadata(metadata: dict) -> dict:
+    """Extract the physics dict the pipeline needs from a volume's metadata.json.
+
+    ALWAYS prefer this over hardcoding: the metadata records the EXACT acquisition +
+    nabu Paganin phase-retrieval parameters (energy, propagation distance, pixel size,
+    delta/beta, unsharp) that we are partially inverting. Getting delta_beta wrong (e.g.
+    assuming 1000 when nabu used 2000) mis-specifies the forward model and the deconv.
+
+    Layout (ESRF/nabu export): scan.tomo.acquisition.{energy, sampleDetectorDistance,
+    detector.samplePixelSize} and scan.tomo.processing.preprocessing.phase.{method,
+    delta_beta, unsharp_coeff, unsharp_sigma}. Falls back across a couple of nestings."""
+    scan = metadata.get("scan", {})
+    tomo = scan.get("tomo", metadata.get("tomo", scan))
+    acq = tomo.get("acquisition", {})
+    det = acq.get("detector", {})
+    proc = tomo.get("processing", {})
+    phase = proc.get("preprocessing", {}).get("phase", {}) if proc else {}
+    # samplePixelSize is in mm in the ESRF metadata -> convert to um
+    px_mm = det.get("samplePixelSize")
+    md = {
+        "energy_kev": float(acq.get("energy", 78.0)),
+        "distance_mm": float(acq.get("sampleDetectorDistance", 220.0)),
+        "pixel_um": float(px_mm * 1000.0) if px_mm else 2.4,
+        "delta_beta": float(phase.get("delta_beta", 1000.0)),
+        "unsharp_sigma": float(phase.get("unsharp_sigma", 1.2)),
+        "unsharp_coeff": float(phase.get("unsharp_coeff", 4.0)),
+        "phase_method": phase.get("method"),
+        # beam-current drift over the scan (used to gate z-drift correction)
+        "machine_current_start": acq.get("machineCurrentStart"),
+        "machine_current_stop": acq.get("machineCurrentStop"),
+    }
+    return md
+
+
+def load_md_phys(zarr_root: str, backend=None) -> dict:
+    """Read a volume's metadata.json (local dir or via an s3zarr backend) -> physics dict.
+
+    If metadata.json EXISTS we ALWAYS use it (policy). Raises FileNotFoundError if the
+    caller asked for metadata-derived physics but none is present, rather than silently
+    falling back to hardcoded defaults (which masked a 2x delta_beta error before)."""
+    import json as _json
+    if backend is not None:  # s3zarr backend: metadata.json sits beside the level dirs
+        txt = backend.get("metadata.json")
+        if txt is None:
+            raise FileNotFoundError("metadata.json not found in backend")
+        meta = _json.loads(txt.decode("utf-8") if isinstance(txt, (bytes, bytearray)) else txt)
+    else:
+        p = os.path.join(zarr_root, "metadata.json")
+        if not os.path.exists(p):
+            raise FileNotFoundError(f"metadata.json not found at {p}")
+        meta = _json.load(open(p))
+    return md_phys_from_metadata(meta)
+
+
 def physics_struct(md_phys: dict) -> _Phys:
     """Build the fysics _Phys from a physics dict (delta_beta, energy_kev, ...)."""
     return _Phys(

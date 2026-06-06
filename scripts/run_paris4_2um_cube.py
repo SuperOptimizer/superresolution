@@ -16,9 +16,7 @@ BUCKET = "vesuvius-challenge-open-data"
 SCROLL = "PHercParis4"
 ZARR = "volumes/20260323153942-2.400um-0.2m-137keV-masked.zarr"
 
-# physics from metadata.json
-MD_PHYS = dict(energy_kev=137.0, distance_mm=220.0, pixel_um=2.4, delta_beta=1000.0)
-WINDOW = (0.01, 0.16)  # target_window_f32_min/max
+WINDOW = (0.01, 0.16)  # target_window_f32_min/max (from metadata zarr_export)
 
 # 1024^3 region anchored at the fully-occupied center (chunk 25,32,32 = vox 3200,4096,4096)
 Z0, Y0, X0 = 3200, 4096, 4096
@@ -32,6 +30,12 @@ def rss_mb():
 def main():
     z = s3zarr.open_s3(BUCKET, SCROLL, ZARR, 0)
     print(f"volume shape {z.shape}  region [{Z0}:{Z0+N},{Y0}:{Y0+N},{X0}:{X0+N}]")
+
+    # DERIVE physics from metadata.json over the S3 backend (policy: always use it).
+    MD_PHYS = fp.load_md_phys(None, backend=z.backend)
+    print(f"physics from metadata.json: energy={MD_PHYS['energy_kev']}keV "
+          f"dist={MD_PHYS['distance_mm']}mm pixel={MD_PHYS['pixel_um']}um "
+          f"delta_beta={MD_PHYS['delta_beta']} ({MD_PHYS.get('phase_method')})")
 
     # bounded read_region wrapping the S3 zarr, offset into the cube origin.
     read = lambda zz, yy, xx, dz, dy, dx: z.read_region(Z0+zz, Y0+yy, X0+xx, dz, dy, dx, workers=16)
