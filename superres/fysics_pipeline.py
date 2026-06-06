@@ -854,6 +854,32 @@ def process_tile(block_u8: np.ndarray, cal: Calibration,
     return cur
 
 
+# ---------------------------------------------------------------- interactive / vc3d API
+def calibrate_for_volume(metadata: dict, sample_chunk_u8: np.ndarray) -> Calibration:
+    """Compute the per-volume Calibration ONCE (call this when a volume is opened), then reuse
+    it for every chunk via preprocess_chunk(). `metadata` = the volume's metadata.json (dict);
+    physics is derived from it (delta_beta/energy/distance/pixel/window). `sample_chunk_u8` = a
+    representative occupied chunk (e.g. a 128^3 from the volume center) used to tune the chain.
+    Air-zero is enabled by default (cut at the histogram valley, auto-derived)."""
+    md = md_phys_from_metadata(metadata)
+    cal = calibrate_prepass(md, [np.ascontiguousarray(sample_chunk_u8, np.uint8)], verbose=False)
+    cal.air_thresh = air_thresh_from_physics(md)
+    cal.do_air_zero = cal.air_thresh is not None
+    return cal
+
+
+def preprocess_chunk(chunk_u8: np.ndarray, cal: Calibration) -> np.ndarray:
+    """Preprocess ONE chunk (e.g. vc3d's bare 32^3) -> u8. Interactive: ~3-8ms per 32^3.
+
+    SEAMS: this processes the chunk WITHOUT a halo, so the chunk INTERIOR is fully correct
+    (contrast restored, papyrus preserved, 0% core loss; median voxel matches the seam-free
+    result exactly) but a thin shell at chunk boundaries differs by ~15 u8 -> faint seam lines
+    between adjacent chunks. For interactive viewing that's acceptable. For SEAM-FREE output
+    (segmentation/measurement), feed a halo-padded block instead (32^3 + ~cal.halo on each
+    side, ~96^3 at 2.4um) and keep the inner 32^3. Same call either way -- just pad the input."""
+    return process_tile(np.ascontiguousarray(chunk_u8, np.uint8), cal)
+
+
 # ---------------------------------------------------------------- pass 1: stream
 def run_pipeline(read_region, write_region, shape, cal: Calibration,
                  tile=256, occupancy_skip=True,
