@@ -15,9 +15,27 @@ L.fy_valley_depth.argtypes = [_i64p, _ip, _ip, _ip]
 L.fy_valley_depth.restype = C.c_double
 
 
+L.fy_edge_sharpness.argtypes = [f32p, C.c_int, C.c_int, C.c_int]; L.fy_edge_sharpness.restype = C.c_double
+L.fy_dynamic_range_usage.argtypes = [_i64p]; L.fy_dynamic_range_usage.restype = C.c_double
+L.fy_flat_noise.argtypes = [f32p, C.c_int, C.c_int, C.c_int, C.c_int]; L.fy_flat_noise.restype = C.c_double
+
+
 def _hist(vol):
     u8 = np.clip(vol*255, 0, 255).astype(np.uint8)
     return np.bincount(u8.ravel(), minlength=256).astype(np.int64)
+
+
+def edge_sharpness(vol):
+    a = np.ascontiguousarray(vol, np.float32)
+    return float(L.fy_edge_sharpness(a.ctypes.data_as(f32p), *a.shape))
+
+def dynamic_range(vol):
+    h = np.ascontiguousarray(_hist(vol))
+    return float(L.fy_dynamic_range_usage(h.ctypes.data_as(_i64p)))
+
+def flat_noise(vol, blk=8):
+    a = np.ascontiguousarray(vol, np.float32)
+    return float(L.fy_flat_noise(a.ctypes.data_as(f32p), *a.shape, blk))
 
 
 def hsj(vol, lo=25, hi=140, min_count=1000):

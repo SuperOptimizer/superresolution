@@ -14,14 +14,16 @@ REGIONS = [(384,384,384),(640,384,384),(200,200,200),(384,640,640),(512,512,512)
 
 
 def panel(f, out):
-    """score one (raw f, processed out) pair across the basket. f,out in [0,1]."""
+    """score one (raw f, processed out) pair across the full quality basket. f,out in [0,1]."""
     pap = binary_erosion(f > (130/255), iterations=2)
     vd = fm.valley_depth(out)
     return dict(
         depth = vd[3] if vd else 0.0,
         hsj   = fm.hsj(out)[0],
-        frc_o = fm.fsc_res(f),
         frc   = fm.fsc_res(out),
+        sharp = fm.edge_sharpness(out)/(fm.edge_sharpness(f)+1e-9),
+        dynrng= fm.dynamic_range(out),
+        noise = fm.flat_noise(out)/(fm.flat_noise(f)+1e-9),
         paptex= fm.hp_texture(out, pap)/(fm.hp_texture(f, pap)+1e-9) if pap.sum()>500 else 0,
         contr = fm.midband_ratio(out, f),
         keep  = (out > 0.001).mean()*100,

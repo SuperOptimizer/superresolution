@@ -290,12 +290,16 @@ def calibrate(md_phys: dict, sample_chunks, window=None,
         if L.fy_estimate_noise(p, nz, ny, nx, 5, 10.0, 0.4, C.byref(nm)) == 0 and nm.noise_ref > 0:
             refs.append(nm.noise_ref)
     noise_ref = float(np.median(refs)) if refs else 0.02
-    # NOTE: deconv runs BEFORE denoise and amplifies the noise ~3-4x (measured on real
-    # PHerc data: flat-region noise 1.56 -> 5.54 u8 levels after deconv). The base
-    # fy_guided_eps_for_noise is calibrated to the RAW noise, so in-pipeline (post-
-    # deconv) it under-denoises. Scale eps for the post-deconv noise: eps ~ noise^2, so
-    # a ~3.5x noise rise -> ~12x eps; empirically x4 on the linear noise (=>~ the same)
-    # restores flat noise BELOW raw while keeping texture. Skip the boost if no deconv.
+    # NOTE: deconv runs BEFORE denoise and amplifies the noise ~3-4x. The base
+    # fy_guided_eps_for_noise is calibrated to the RAW noise, so in-pipeline (post-deconv)
+    # it under-denoises -> boost eps. NOTE this only seeds guided_eps_raw; the joint search
+    # in calibrate_prepass picks the FINAL eps from its EPS_GRID via _metric_panel.
+    # OPEN FINDING (2026-06-06): the whole-chain quality basket [[whole-pipeline-validation]]
+    # shows the joint search OVER-DENOISES (picks eps~0.009; the noise<=1 & sharp>=1 knee is
+    # eps~0.004-0.005, which keeps +20% contrast and stays net-sharp). Root cause: _metric_panel
+    # rewards noise reduction more than the whole-chain basket. FIX = reconcile _metric_panel
+    # with the basket (constrain noise<=raw, sharp>=1); not a one-line gain change (verified:
+    # changing this gain doesn't move the joint-search result).
     POST_DECONV_NOISE_GAIN = 3.5
     guided_eps_raw = L.fy_guided_eps_for_noise(noise_ref)
     guided_eps = L.fy_guided_eps_for_noise(noise_ref * POST_DECONV_NOISE_GAIN)
