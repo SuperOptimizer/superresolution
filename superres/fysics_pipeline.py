@@ -833,19 +833,27 @@ def process_tile(block_u8: np.ndarray, cal: Calibration,
                 break
             scratch = so
         # threshold: explicit air_cut_u8, else the clean scratch's VALLEY (the histogram
-        # minimum between the dark 'other' and papyrus modes = the max-separation boundary).
-        # Measured across regions: cutting at the valley removes 0% of confident-papyrus core
-        # (only the ambiguous dark 'other'), so the valley is the principled aggressive cut.
-        # (dark_mode+8 was over-conservative -- left ~10-15% of borderline-dark voxels in.)
+        # THRESHOLD PRIORITY: (1) explicit cal.air_cut_u8 (e.g. a GLOBAL volume-wide cut --
+        # preferred; consistent across all chunks), else (2) anchor to the scratch's DARK MODE
+        # + a small margin. We anchor to the DARK MODE, NOT the valley: per-128^3-chunk the
+        # valley is UNSTABLE (it depends on each chunk's papyrus/air RATIO -- measured 55..95
+        # across chunks of one volume), and when it lands high (95, deep in papyrus) it ZEROS
+        # REAL PAPYRUS. The dark mode is STABLE (air/void attenuation is constant: 48-49 across
+        # the same chunks) so dark+margin gives a consistent, papyrus-safe cut everywhere.
         if cal.air_cut_u8 is not None:
-            cut = int(cal.air_cut_u8)
+            cut = int(cal.air_cut_u8)              # global / explicit -> consistent
         else:
             su8 = np.ascontiguousarray(np.clip(scratch * 255 + 0.5, 0, 255).astype(np.uint8))
             hist = np.bincount(su8.ravel(), minlength=256).astype(np.int64)
             dark = C.c_int(0); light = C.c_int(0); valley = C.c_int(0)
             d = L.fy_valley_depth(hist.ctypes.data_as(C.POINTER(C.c_long)),
                                   C.byref(dark), C.byref(light), C.byref(valley))
-            cut = valley.value if d >= 0 else int((cal.air_thresh or 0.05) * 255)
+            if d >= 0:
+                # cut just above the dark 'other' mode; cap WELL below the valley so we never
+                # reach into papyrus even when the (unstable) valley sits high.
+                cut = min(dark.value + 8, (dark.value + valley.value) // 2)
+            else:
+                cut = int((cal.air_thresh or 0.05) * 255)
         air = scratch < (cut / 255.0)        # decided on the clean scratch
         cur = np.where(air, 0.0, cur)         # zero air in the PROCESSED output
 
@@ -918,22 +926,27 @@ def run_pipeline(read_region, write_region, shape, cal: Calibration,
 
 # ---------------------------------------------------------------- pass 1: global stats
 def accumulate_global_stats(read_region, shape, cal: Calibration, tile=256,
-                            want_norm=True, want_zdrift=True,
+                            want_norm=True, want_zdrift=True, want_air_cut=True,
                             norm_lo_pct=0.5, norm_hi_pct=99.5,
                             zdrift_min_frac=0.05,
                             progress=lambda *_: None):
     """PASS 1 (streaming, cheap): accumulate WHOLE-VOLUME statistics so pass 2 can apply
-    a CONSISTENT global mapping -- the proper way to normalize a volume too big for RAM.
+    a CONSISTENT global mapping -- the proper way to process a volume too big for RAM, and
+    the FIX for per-chunk inconsistency (a per-128^3 air valley is unstable -> zeros real
+    papyrus on dense chunks; a GLOBAL cut is consistent and papyrus-safe).
 
-      - global histogram -> lo/hi percentiles for normalization + Otsu air threshold
-      - per-z papyrus mean -> beam-current / shading DRIFT correction (intensity ranges
-        across the volume; metadata machineCurrentStart/Stop confirms ~1.5-13.7% decay).
-    State is tiny (256-bin histogram + 2 arrays of length Z). Mutates `cal` in place
-    (sets norm_lo/hi, air_thresh, zdrift_factor). Reads NO halo -- plain tiling.
+      - global histogram -> lo/hi percentiles for normalization
+      - GLOBAL AIR CUT: histogram of the SCRATCH-DENOISED volume -> ONE dark-mode-anchored
+        air threshold for the whole volume (-> cal.air_cut_u8, used by every pass-2 chunk).
+      - per-z papyrus mean -> beam-current / shading DRIFT correction.
+    State is tiny (two 256-bin histograms + 2 arrays of length Z). Mutates `cal` in place
+    (sets norm_lo/hi, air_cut_u8, zdrift_factor). Reads NO halo -- plain tiling.
     """
     L = lib()
+    f32p_ = C.POINTER(C.c_float)
     Z, Y, X = shape
     hist = _HistState(); L.fy_hist_init(C.byref(hist))
+    air_hist = np.zeros(256, np.int64)   # histogram of scratch-denoised values (for the air cut)
     sums = np.zeros(Z, np.float64); counts = np.zeros(Z, np.int64)
     sums_p = sums.ctypes.data_as(C.POINTER(C.c_double))
     counts_p = counts.ctypes.data_as(C.POINTER(C.c_long))
@@ -955,6 +968,19 @@ def accumulate_global_stats(read_region, shape, cal: Calibration, tile=256,
                 if want_norm:
                     L.fy_hist_accumulate_u8(C.byref(hist),
                                             u8.ctypes.data_as(C.POINTER(C.c_ubyte)), u8.size)
+                if want_air_cut and cal.do_air_zero:
+                    # scratch-denoise this tile (same as process_tile's air-mask scratch) and
+                    # accumulate its histogram -> the GLOBAL air cut is derived from the whole
+                    # volume's denoised distribution, not each chunk's.
+                    sc = np.ascontiguousarray(u8.astype(np.float32) / 255.0)
+                    for _ in range(int(cal.scratch_passes)):
+                        so = np.empty_like(sc)
+                        if L.fy_guided_denoise(sc.ctypes.data_as(f32p_), so.ctypes.data_as(f32p_),
+                                               *sc.shape, 2, C.c_double(0.01)) != 0:
+                            break
+                        sc = so
+                    su8 = np.clip(sc * 255 + 0.5, 0, 255).astype(np.uint8)
+                    air_hist += np.bincount(su8.ravel(), minlength=256).astype(np.int64)
                 if want_zdrift:
                     f = np.ascontiguousarray(u8.astype(np.float32) / 255.0)
                     L.fy_zdrift_accumulate(f.ctypes.data_as(C.POINTER(C.c_float)),
@@ -964,6 +990,18 @@ def accumulate_global_stats(read_region, shape, cal: Calibration, tile=256,
         cal.norm_hi = int(L.fy_hist_percentile_u8(C.byref(hist), norm_hi_pct))
         cal.air_thresh = (cal.air_thresh_physics if cal.air_thresh_physics is not None
                           else float(L.fy_auto_air_thresh(C.byref(hist))))
+    # GLOBAL AIR CUT: derive ONE dark-mode-anchored cut from the whole-volume scratch
+    # histogram -> every pass-2 chunk uses the SAME papyrus-safe threshold (fixes per-chunk
+    # valley instability that zeroed real papyrus).
+    if want_air_cut and cal.do_air_zero and air_hist.sum() > 0:
+        ah = np.ascontiguousarray(air_hist)
+        dark = C.c_int(0); light = C.c_int(0); valley = C.c_int(0)
+        d = L.fy_valley_depth(ah.ctypes.data_as(C.POINTER(C.c_long)),
+                              C.byref(dark), C.byref(light), C.byref(valley))
+        if d >= 0:
+            cal.air_cut_u8 = min(dark.value + 8, (dark.value + valley.value) // 2)
+        else:
+            cal.air_cut_u8 = int((cal.air_thresh or 0.05) * 255)
     if want_zdrift and counts.sum() > 0:
         factor = np.zeros(Z, np.float32)
         L.fy_zdrift_finalize(sums_p, counts_p, Z,
