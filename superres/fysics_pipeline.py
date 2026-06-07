@@ -267,7 +267,8 @@ class Calibration:
         # full processing). air_cut_u8 = the threshold on the scratch (set from the clean
         # scratch's fitted dark mode, dark_mu+0.5sigma); scratch_passes = bilateral iterations.
         self.do_air_zero = False
-        self.air_cut_u8 = None        # u8 threshold on the denoised scratch (None -> derive)
+        self.air_cut_u8 = None        # GLOBAL u8 cut on the denoised scratch (pass-1 anchor)
+        self.air_cut_band = 8         # +/- band (u8) the local per-chunk cut may move within
         self.scratch_passes = 5
         self.tuning = {}                # per-stage chosen value + metric panel (for inspection)
 
@@ -832,28 +833,31 @@ def process_tile(block_u8: np.ndarray, cal: Calibration,
             if L.fy_guided_denoise(sp, sop, nz, ny, nx, 2, C.c_double(0.01)) != 0:
                 break
             scratch = so
-        # threshold: explicit air_cut_u8, else the clean scratch's VALLEY (the histogram
-        # THRESHOLD PRIORITY: (1) explicit cal.air_cut_u8 (e.g. a GLOBAL volume-wide cut --
-        # preferred; consistent across all chunks), else (2) anchor to the scratch's DARK MODE
-        # + a small margin. We anchor to the DARK MODE, NOT the valley: per-128^3-chunk the
-        # valley is UNSTABLE (it depends on each chunk's papyrus/air RATIO -- measured 55..95
-        # across chunks of one volume), and when it lands high (95, deep in papyrus) it ZEROS
-        # REAL PAPYRUS. The dark mode is STABLE (air/void attenuation is constant: 48-49 across
-        # the same chunks) so dark+margin gives a consistent, papyrus-safe cut everywhere.
+        # THRESHOLD = GLOBAL anchor + bounded LOCAL adjustment. The cut genuinely varies a
+        # little chunk-to-chunk (local shading / partial-volume / drift shift the air|papyrus
+        # boundary), so a single rigid global cut is too conservative in some regions. But a
+        # pure per-chunk valley is UNSTABLE -- it can spike to ~95 (deep in papyrus) and ZERO
+        # REAL PAPYRUS. So: compute the LOCAL valley for this chunk, but CLAMP it to a band
+        # [global-band, global+band] around the GLOBAL cut (cal.air_cut_u8 from pass 1). Local
+        # adaptivity within safe bounds -> the runaway can't happen, but the cut still tracks
+        # local variation. Falls back to a dark-mode-anchored cut if no global cut is set.
+        su8 = np.ascontiguousarray(np.clip(scratch * 255 + 0.5, 0, 255).astype(np.uint8))
+        hist = np.bincount(su8.ravel(), minlength=256).astype(np.int64)
+        dark = C.c_int(0); light = C.c_int(0); valley = C.c_int(0)
+        d = L.fy_valley_depth(hist.ctypes.data_as(C.POINTER(C.c_long)),
+                              C.byref(dark), C.byref(light), C.byref(valley))
         if cal.air_cut_u8 is not None:
-            cut = int(cal.air_cut_u8)              # global / explicit -> consistent
-        else:
-            su8 = np.ascontiguousarray(np.clip(scratch * 255 + 0.5, 0, 255).astype(np.uint8))
-            hist = np.bincount(su8.ravel(), minlength=256).astype(np.int64)
-            dark = C.c_int(0); light = C.c_int(0); valley = C.c_int(0)
-            d = L.fy_valley_depth(hist.ctypes.data_as(C.POINTER(C.c_long)),
-                                  C.byref(dark), C.byref(light), C.byref(valley))
+            g = int(cal.air_cut_u8); band = int(cal.air_cut_band)
             if d >= 0:
-                # cut just above the dark 'other' mode; cap WELL below the valley so we never
-                # reach into papyrus even when the (unstable) valley sits high.
-                cut = min(dark.value + 8, (dark.value + valley.value) // 2)
+                # local estimate: midway dark->valley (a bit above the dark 'other'); clamp to band
+                local = (dark.value + valley.value) // 2
+                cut = int(np.clip(local, g - band, g + band))
             else:
-                cut = int((cal.air_thresh or 0.05) * 255)
+                cut = g
+        elif d >= 0:
+            cut = min(dark.value + 8, (dark.value + valley.value) // 2)
+        else:
+            cut = int((cal.air_thresh or 0.05) * 255)
         air = scratch < (cut / 255.0)        # decided on the clean scratch
         cur = np.where(air, 0.0, cur)         # zero air in the PROCESSED output
 
@@ -1031,7 +1035,13 @@ def accumulate_global_stats(read_region, shape, cal: Calibration, tile=256,
         d = L.fy_valley_depth(ah.ctypes.data_as(C.POINTER(C.c_long)),
                               C.byref(dark), C.byref(light), C.byref(valley))
         if d >= 0:
-            cal.air_cut_u8 = min(dark.value + 8, (dark.value + valley.value) // 2)
+            # GLOBAL anchor = the dark->valley MIDPOINT (between over-conservative dark+8 and
+            # the aggressive valley). Measured: papyrus_core_removed stays 0.00% across the
+            # whole dark..valley range; the v1 papyrus loss came from the UNSTABLE per-chunk
+            # valley spiking PAST the valley (~95), which the global anchor + bounded local
+            # adjustment now prevents. Band = quarter of the dark..valley span (local wiggle).
+            cal.air_cut_u8 = (dark.value + valley.value) // 2
+            cal.air_cut_band = max(4, (valley.value - dark.value) // 4)
         else:
             cal.air_cut_u8 = int((cal.air_thresh or 0.05) * 255)
     if want_zdrift and counts.sum() > 0:
