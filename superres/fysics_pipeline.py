@@ -63,6 +63,9 @@ def _load():
     lib.fy_guided_denoise.argtypes = [f32p, f32p, C.c_int, C.c_int, C.c_int,
                                       C.c_int, C.c_double]
     lib.fy_guided_denoise.restype = C.c_int
+    # MUSICA multiscale contrast (per-slice 2D) -- the Step-2 viewing enhancement
+    lib.fy_musica2d.argtypes = [f32p, f32p, C.c_int, C.c_int, C.c_int, C.c_float, C.c_float]
+    lib.fy_musica2d.restype = C.c_int
     lib.fy_coherence_diffusion_auto.argtypes = [f32p, f32p, C.c_int, C.c_int, C.c_int, C.c_int]
     lib.fy_coherence_diffusion_auto.restype = C.c_int
     lib.fy_coherence_diffusion_halo.argtypes = [C.c_double, C.c_double, C.c_int]
@@ -270,6 +273,11 @@ class Calibration:
         self.air_cut_u8 = None        # GLOBAL u8 cut on the denoised scratch (pass-1 anchor)
         self.air_cut_band = 8         # +/- band (u8) the local per-chunk cut may move within
         self.scratch_passes = 5
+        # ---- STEP 2: MUSICA viewing enhancement (cosmetic, toggleable; off by default) ----
+        self.do_musica = False        # apply MUSICA multiscale contrast (human-viewing layer)
+        self.musica_p = 0.6           # gain exponent (<1 boosts faint detail; lower=stronger)
+        self.musica_levels = 4        # pyramid depth
+        self.musica_core = 0.0        # noise coring (0 disables)
         self.tuning = {}                # per-stage chosen value + metric panel (for inspection)
 
     def scaled_phys(self) -> _Phys:
@@ -751,6 +759,31 @@ def calibrate_prepass(md_phys: dict, sample_tiles, auto_deltabeta=True, verbose=
     return cal
 
 
+def _musica_clip_aware(cur, block_u8, cal):
+    """Apply MUSICA per-slice (along z) to the float volume `cur`, CLIP-AWARE: inpaint the
+    export rails (orig u8 >= 254 or == 0) with a local median before MUSICA so the clip
+    plateaus don't create false edges the pyramid amplifies, then restore the rails as-is."""
+    L = lib(); f32p = C.POINTER(C.c_float)
+    from scipy.ndimage import median_filter
+    rail = (block_u8 >= 254) | (block_u8 == 0)
+    out = np.empty_like(cur, dtype=np.float32)
+    nz = cur.shape[0]
+    for z in range(nz):
+        sl = np.ascontiguousarray(cur[z], np.float32)
+        rl = rail[z]
+        if rl.any():
+            med = median_filter(sl, size=5)
+            sl = sl.copy(); sl[rl] = med[rl]          # inpaint rails -> smooth continuation
+        o = np.empty_like(sl)
+        L.fy_musica2d(sl.ctypes.data_as(f32p), o.ctypes.data_as(f32p), sl.shape[0], sl.shape[1],
+                      int(cal.musica_levels), C.c_float(cal.musica_p), C.c_float(cal.musica_core))
+        o = np.clip(o, 0.0, 1.0)
+        if rl.any():
+            o[rl] = cur[z][rl]                          # restore rails as-is
+        out[z] = o
+    return out
+
+
 def process_tile(block_u8: np.ndarray, cal: Calibration,
                  do_deconv=None, do_denoise=None, do_diffusion=None,
                  diffusion_strength=None, do_mask=None) -> np.ndarray:
@@ -861,6 +894,16 @@ def process_tile(block_u8: np.ndarray, cal: Calibration,
         air = scratch < (cut / 255.0)        # decided on the clean scratch
         cur = np.where(air, 0.0, cur)         # zero air in the PROCESSED output
 
+    # STEP 2: MUSICA viewing enhancement (cosmetic, toggleable). CLIP-AWARE: the export
+    # window saturates the brightest material to u8=255 (and zeros air to 0); MUSICA's
+    # Laplacian pyramid would treat those clip plateaus as real edges and AMPLIFY them
+    # (measured: ~19% of near-rail pixels pushed to new 255s). So inpaint the rails (>=254
+    # and 0) with a local median BEFORE MUSICA (smooth continuation, no false edge), run
+    # MUSICA per-slice, then RESTORE the rails as-is. Applied LAST -- it's a non-invertible
+    # display remap on top of the recovered signal; keep the signal-recovery output separate.
+    if cal.do_musica:
+        cur = _musica_clip_aware(cur, block_u8, cal)
+
     # back to u8
     cur = np.clip(cur * 255.0 + 0.5, 0, 255).astype(np.uint8)
     return cur
@@ -882,7 +925,8 @@ def calibrate_for_volume(metadata: dict, sample_chunk_u8: np.ndarray) -> Calibra
 
 def preprocess_volume(read_region, write_region, shape, metadata: dict, sample_tiles,
                       tile=128, do_air_zero=True, scratch_passes=5,
-                      do_normalize=True, do_zdrift=True, progress=lambda *_: None):
+                      do_normalize=True, do_zdrift=True,
+                      do_musica=False, musica_p=0.6, progress=lambda *_: None):
     """WHOLE-VOLUME preprocessing the RIGHT way: GLOBAL calibration + 2-pass, NOT per-chunk.
 
     This is the fix for per-chunk inconsistency (a per-128^3 air valley / calibration varies
@@ -901,6 +945,7 @@ def preprocess_volume(read_region, write_region, shape, metadata: dict, sample_t
     cal.air_thresh = air_thresh_from_physics(md)
     cal.do_air_zero = do_air_zero and (cal.air_thresh is not None)
     cal.scratch_passes = scratch_passes
+    cal.do_musica = do_musica; cal.musica_p = musica_p   # Step-2 viewing enhancement (clip-aware)
     # metadata beam-current drift over the scan (physical ground truth for the z-drift gate)
     cs, ce = md.get("machine_current_start"), md.get("machine_current_stop")
     cal.beam_drift_frac = (abs(ce - cs) / cs) if (cs and ce and cs > 0) else None
