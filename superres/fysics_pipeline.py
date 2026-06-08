@@ -53,6 +53,17 @@ def _load():
     lib.fy_deconvolve.argtypes = [f32p, f32p, C.c_int, C.c_int, C.c_int,
                                   C.POINTER(_Phys), C.c_double]
     lib.fy_deconvolve.restype = C.c_int
+    # PSF-aware Gureyev/TIE-Hom Wiener inverse: inverts the reduced-strength Paganin AND the
+    # Gaussian system PSF (p->psf_sigma_vox), Tikhonov-regularized. Matches nabu's known
+    # forward operator (Paganin db -> unsharp) far better than the plain inverse.
+    lib.fy_deconvolve_gureyev.argtypes = [f32p, f32p, C.c_int, C.c_int, C.c_int,
+                                          C.POINTER(_Phys), C.c_double]
+    lib.fy_deconvolve_gureyev.restype = C.c_int
+    # OPERATOR-MATCHED Wiener: inverts ONLY the measured effective operator (PSF * unsharp),
+    # NOT the full Paganin -> the only linear deconv that moves BM18 data toward truth.
+    lib.fy_deconvolve_matched.argtypes = [f32p, f32p, C.c_int, C.c_int, C.c_int,
+                                          C.POINTER(_Phys), C.c_double]
+    lib.fy_deconvolve_matched.restype = C.c_int
     lib.fy_auto_deltabeta_scale.argtypes = [C.POINTER(_Phys)]
     lib.fy_auto_deltabeta_scale.restype = C.c_double
     lib.fy_estimate_noise.argtypes = [f32p, C.c_int, C.c_int, C.c_int, C.c_int,
@@ -260,6 +271,13 @@ class Calibration:
         self.deconv_reg = -1.0          # <=0 -> kernel auto
         self.deconv_lo = 0.0            # GLOBAL deconv-output range for seam-safe rescale
         self.deconv_hi = 1.0            # (measured in the pre-pass; same for every tile)
+        # OPERATOR-MATCHED deconv -- inverts nabu's MEASURED effective operator (PSF * unsharp),
+        # NOT the full Paganin. When use_matched_deconv, process_tile uses fy_deconvolve_matched
+        # with psf_sigma_vox (measured BM18 effective PSF ~1.0 vox) + deconv_tikhonov. The only
+        # linear deconv proven to move data toward truth (RMSE 0.0225) without amplitude overshoot.
+        self.use_matched_deconv = False
+        self.psf_sigma_vox = 0.0        # measured effective system PSF (voxels); 0 -> plain
+        self.deconv_tikhonov = 0.05     # Tikhonov gamma for the matched Wiener inverse
         self.do_denoise = True
         self.denoise_radius = 2
         self.do_diffusion = False
@@ -283,7 +301,8 @@ class Calibration:
     def scaled_phys(self) -> _Phys:
         p = _Phys(self.phys.delta_beta * self.db_scale, self.phys.energy_kev,
                   self.phys.distance_mm, self.phys.pixel_um,
-                  self.phys.unsharp_sigma, self.phys.unsharp_coeff, 0.0)
+                  self.phys.unsharp_sigma, self.phys.unsharp_coeff,
+                  self.psf_sigma_vox)   # measured system PSF (0 -> plain Paganin)
         return p
 
 
@@ -301,15 +320,23 @@ def calibrate(md_phys: dict, sample_chunks, window=None,
     db_scale = L.fy_auto_deltabeta_scale(C.byref(phys)) if auto_deltabeta else 1.0
     halo = L.fy_kernel_halo(C.byref(phys))
 
-    # noise level: median noise_ref over the sampled textured chunks
-    refs = []
+    # noise level: median noise_ref over the sampled textured chunks. noise_ref is kept for
+    # DIAGNOSTICS only -- the BM18 physics workflow showed it is TEXTURE-INFLATED (it folds
+    # papyrus fiber texture into "noise"), giving eps~0.005 which OVER-denoises 2.5x. The eps
+    # driver is the CLEAN NOISE FLOOR fy_flat_noise (median local std in flat papyrus blocks),
+    # which the photon-budget analysis confirms gives the detail-preserving eps~0.002 crossover.
+    refs = []; floors = []
     for ch in sample_chunks:
         arr, p = _fp(ch)
         nm = _NoiseModel()
         nz, ny, nx = arr.shape
         if L.fy_estimate_noise(p, nz, ny, nx, 5, 10.0, 0.4, C.byref(nm)) == 0 and nm.noise_ref > 0:
             refs.append(nm.noise_ref)
+        fn = L.fy_flat_noise(p, nz, ny, nx, 8)   # clean noise floor in [0,1]
+        if fn > 0:
+            floors.append(fn)
     noise_ref = float(np.median(refs)) if refs else 0.02
+    flat_nf = float(np.median(floors)) if floors else 0.015
     # NOTE: deconv runs BEFORE denoise and amplifies the noise ~3-4x. The base
     # fy_guided_eps_for_noise is calibrated to the RAW noise, so in-pipeline (post-deconv)
     # it under-denoises -> boost eps. NOTE this only seeds guided_eps_raw; the joint search
@@ -320,11 +347,15 @@ def calibrate(md_phys: dict, sample_chunks, window=None,
     # rewards noise reduction more than the whole-chain basket. FIX = reconcile _metric_panel
     # with the basket (constrain noise<=raw, sharp>=1); not a one-line gain change (verified:
     # changing this gain doesn't move the joint-search result).
-    POST_DECONV_NOISE_GAIN = 3.5
-    guided_eps_raw = L.fy_guided_eps_for_noise(noise_ref)
-    guided_eps = L.fy_guided_eps_for_noise(noise_ref * POST_DECONV_NOISE_GAIN)
+    # EPS from the CLEAN NOISE FLOOR (BM18-verified): eps = (k * flat_nf)^2, k=3. For this
+    # volume flat_nf~0.0149 -> eps~0.0020, the detail-preserving crossover (air-noise and
+    # papyrus fiber texture are spectrally entangled; harder eps kills fiber detail for ~0
+    # noise gain). This REPLACES the texture-inflated noise_ref driver (which gave ~0.005).
+    guided_eps_raw = float((3.0 * flat_nf) ** 2)
+    guided_eps = guided_eps_raw
     cal = Calibration(phys, db_scale, noise_ref, guided_eps, halo, window,
                       guided_eps_raw=guided_eps_raw)
+    cal.flat_nf = flat_nf
     # PHYSICS-DERIVED air threshold from the export window (preferred over Otsu, which on a
     # mostly-material tile finds a within-papyrus split). None if the window is unknown.
     cal.air_thresh_physics = air_thresh_from_physics(md_phys)
@@ -816,7 +847,15 @@ def process_tile(block_u8: np.ndarray, cal: Calibration,
         inp, ip = _fp(cur)
         out = np.empty_like(inp); op = out.ctypes.data_as(C.POINTER(C.c_float))
         ph = cal.scaled_phys()
-        rc = L.fy_deconvolve(ip, op, nz, ny, nx, C.byref(ph), C.c_double(cal.deconv_reg))
+        if cal.use_matched_deconv and cal.psf_sigma_vox > 0:
+            # OPERATOR-MATCHED Wiener inverse of nabu's MEASURED effective operator
+            # (PSF(psf_sigma_vox) * unsharp(coeff,sigma)) -- NOT the full Paganin (nabu's
+            # unsharp already removed most Paganin blur; effective blur ~1 vox). The only
+            # linear deconv shown to move data TOWARD truth (RMSE 0.0225) without overshoot.
+            rc = L.fy_deconvolve_matched(ip, op, nz, ny, nx, C.byref(ph),
+                                         C.c_double(cal.deconv_tikhonov))
+        else:
+            rc = L.fy_deconvolve(ip, op, nz, ny, nx, C.byref(ph), C.c_double(cal.deconv_reg))
         if rc != 0:
             raise RuntimeError("fy_deconvolve failed")
         # seam-safe GLOBAL rescale of the deconv overshoot to [0,1] (don't hard-clip)
@@ -926,7 +965,8 @@ def calibrate_for_volume(metadata: dict, sample_chunk_u8: np.ndarray) -> Calibra
 def preprocess_volume(read_region, write_region, shape, metadata: dict, sample_tiles,
                       tile=128, do_air_zero=True, scratch_passes=5,
                       do_normalize=True, do_zdrift=True,
-                      do_musica=False, musica_p=0.6, progress=lambda *_: None):
+                      store_deconv=False, do_musica=False, musica_p=0.6,
+                      progress=lambda *_: None):
     """WHOLE-VOLUME preprocessing the RIGHT way: GLOBAL calibration + 2-pass, NOT per-chunk.
 
     This is the fix for per-chunk inconsistency (a per-128^3 air valley / calibration varies
@@ -946,6 +986,11 @@ def preprocess_volume(read_region, write_region, shape, metadata: dict, sample_t
     cal.do_air_zero = do_air_zero and (cal.air_thresh is not None)
     cal.scratch_passes = scratch_passes
     cal.do_musica = do_musica; cal.musica_p = musica_p   # Step-2 viewing enhancement (clip-aware)
+    # BM18 physics verdict: deconv is CONTRAST-ONLY (view-time), NOT stored. The plain inverse
+    # over-boosts blur nabu's unsharp already removed -> noise blowup. Stored chain = denoise +
+    # air-zero only (the denoise is the one stage proven to move data toward truth). Deconv
+    # (matched Wiener, view-time) stays off for storage unless explicitly requested.
+    cal.do_deconv = store_deconv
     # metadata beam-current drift over the scan (physical ground truth for the z-drift gate)
     cs, ce = md.get("machine_current_start"), md.get("machine_current_stop")
     cal.beam_drift_frac = (abs(ce - cs) / cs) if (cs and ce and cs > 0) else None
