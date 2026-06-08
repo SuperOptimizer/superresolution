@@ -882,7 +882,7 @@ def calibrate_for_volume(metadata: dict, sample_chunk_u8: np.ndarray) -> Calibra
 
 def preprocess_volume(read_region, write_region, shape, metadata: dict, sample_tiles,
                       tile=128, do_air_zero=True, scratch_passes=5,
-                      do_normalize=False, do_zdrift=False, progress=lambda *_: None):
+                      do_normalize=True, do_zdrift=True, progress=lambda *_: None):
     """WHOLE-VOLUME preprocessing the RIGHT way: GLOBAL calibration + 2-pass, NOT per-chunk.
 
     This is the fix for per-chunk inconsistency (a per-128^3 air valley / calibration varies
@@ -901,6 +901,9 @@ def preprocess_volume(read_region, write_region, shape, metadata: dict, sample_t
     cal.air_thresh = air_thresh_from_physics(md)
     cal.do_air_zero = do_air_zero and (cal.air_thresh is not None)
     cal.scratch_passes = scratch_passes
+    # metadata beam-current drift over the scan (physical ground truth for the z-drift gate)
+    cs, ce = md.get("machine_current_start"), md.get("machine_current_stop")
+    cal.beam_drift_frac = (abs(ce - cs) / cs) if (cs and ce and cs > 0) else None
     progress("calibrated", 0.0)
     # GLOBAL AIR CUT from the SAMPLE TILES (fast). The dark mode is stable across the volume
     # (measured 48-49 u8 across chunks), so the air valley/cut from the representative sample
@@ -954,14 +957,36 @@ def preprocess_volume(read_region, write_region, shape, metadata: dict, sample_t
             done[0] += 1; progress("pass2", 100.0*done[0]/total)
         if not np.any(blk):
             return
-        out = process_tile(np.ascontiguousarray(blk, np.uint8), cal,
+        u8 = np.ascontiguousarray(blk, np.uint8)
+        # GLOBAL intensity corrections FIRST (on the haloed block, float [0,1]): normalize
+        # to global lo/hi percentiles, then z-drift / beam-shading correction (data-gated --
+        # zdrift_factor is None unless measured drift was significant). Order: shading-correct
+        # BEFORE deconv/denoise/mask, so the chain sees consistent intensities across z.
+        if do_normalize and cal.norm_lo is not None:
+            f = np.empty(u8.size, np.float32)
+            L.fy_norm_apply_u8(u8.ctypes.data_as(C.POINTER(C.c_ubyte)),
+                               f.ctypes.data_as(C.POINTER(C.c_float)), u8.size,
+                               C.c_ubyte(cal.norm_lo), C.c_ubyte(cal.norm_hi))
+            fcur = f.reshape(u8.shape)
+        else:
+            fcur = u8.astype(np.float32) / 255.0
+        if do_zdrift and cal.zdrift_factor is not None:
+            fcur = np.ascontiguousarray(fcur)
+            L.fy_zdrift_apply(fcur.ctypes.data_as(C.POINTER(C.c_float)),
+                              fcur.shape[0], fcur.shape[1], fcur.shape[2], rz0,
+                              cal.zdrift_factor.ctypes.data_as(C.POINTER(C.c_float)))
+        blk_corr = np.clip(fcur * 255.0 + 0.5, 0, 255).astype(np.uint8)
+        out = process_tile(blk_corr, cal,
                             do_deconv=cal.do_deconv, do_denoise=cal.do_denoise, do_diffusion=False)
         iz0, iy0, ix0 = z0-rz0, y0-ry0, x0-rx0
         write_region(z0, y0, x0, out[iz0:iz0+tz, iy0:iy0+ty, ix0:ix0+tx])
 
     with ThreadPoolExecutor(max_workers=workers) as ex:
         list(ex.map(do_tile, coords))
-    return {"tiles_total": total, "tiles_processed": total}, cal
+    return {"tiles_total": total, "tiles_processed": total,
+            "norm_lo": cal.norm_lo, "norm_hi": cal.norm_hi,
+            "zdrift": cal.zdrift_factor is not None,
+            "zdrift_drift_frac": getattr(cal, "zdrift_drift_frac", None)}, cal
 
 
 def preprocess_chunk(chunk_u8: np.ndarray, cal: Calibration) -> np.ndarray:
@@ -1090,8 +1115,22 @@ def accumulate_global_stats(read_region, shape, cal: Calibration, tile=256,
             hist.hist[i] += int(norm_counts[i])
         hist.total += int(norm_counts.sum())
     if want_norm and hist.total > 0:
-        cal.norm_lo = int(L.fy_hist_percentile_u8(C.byref(hist), norm_lo_pct))
-        cal.norm_hi = int(L.fy_hist_percentile_u8(C.byref(hist), norm_hi_pct))
+        lo = int(L.fy_hist_percentile_u8(C.byref(hist), norm_lo_pct))
+        hi = int(L.fy_hist_percentile_u8(C.byref(hist), norm_hi_pct))
+        # GATE: only normalize if the volume SEVERELY under-uses the u8 range. The export
+        # WINDOW (metadata zarr_export) already maps the recon to a sensible u8 spread, so
+        # re-stretching to lo/hi percentiles is REDUNDANT and just shifts brightness with no
+        # benefit (measured: a volume at 52% range-use got pushed 112->154 brighter, blowing
+        # out contrast, for nothing). Papyrus CT legitimately uses ~50% of the range (air at
+        # the bottom, material in the middle). Only correct GENUINE under-use (< ~40% span),
+        # which export-windowed volumes never hit -- and the deconv's own seam-safe rescale
+        # already manages dynamic range. So this is effectively OFF for normal exports.
+        span_frac = (hi - lo) / 255.0
+        cal.norm_span_frac = span_frac
+        if span_frac < 0.40:
+            cal.norm_lo = lo; cal.norm_hi = hi
+        else:
+            cal.norm_lo = None; cal.norm_hi = None  # already well-windowed -> don't rescale
         cal.air_thresh = (cal.air_thresh_physics if cal.air_thresh_physics is not None
                           else float(L.fy_auto_air_thresh(C.byref(hist))))
     # GLOBAL AIR CUT: derive ONE dark-mode-anchored cut from the whole-volume scratch
@@ -1118,17 +1157,38 @@ def accumulate_global_stats(read_region, shape, cal: Calibration, tile=256,
         factor = np.zeros(Z, np.float32)
         L.fy_zdrift_finalize(sums_p, counts_p, Z,
                              factor.ctypes.data_as(C.POINTER(C.c_float)))
-        # GATE: only keep the correction if the drift is SIGNIFICANT. On a volume with
-        # little drift the smoothed factor just fits noise and ADDS spread (measured:
-        # PHercParis4 45um has ~3% drift -> correction hurt). The factor's own range is
-        # the measured drift magnitude; require > a threshold (default 5%). The metadata
-        # beam-current delta is the physical confirmation (set cal.beam_drift_frac).
-        fr = float(np.nanmax(factor)) - float(np.nanmin(factor))
-        cal.zdrift_drift_frac = fr
-        if fr >= zdrift_min_frac:
+        # GATE on TWO independent signals (must BOTH agree drift is real), because the
+        # per-z papyrus-mean profile CONFLATES beam drift with papyrus-DENSITY variation
+        # across z -- so our measured "drift" can be a density artifact (measured: a volume
+        # already flat at CV 1.9% got a bogus 21% "drift" -> z-drift correction made it WORSE).
+        #   (a) MEASURED COHERENCE: the per-z brightness must be a real monotonic-ish SLOPE,
+        #       not flat-with-noise. Use the linear-trend fraction: |linear span| / total
+        #       variation. A true beam drift is ~monotonic (high fraction); density noise is
+        #       not (low fraction).
+        #   (b) METADATA confirmation: the machine beam current must have actually drifted
+        #       (cal.beam_drift_frac from metadata machineCurrentStart/Stop).
+        prof = sums / np.maximum(counts, 1)          # raw per-z papyrus mean
+        valid = counts > 0
+        if valid.sum() >= 8:
+            zi = np.arange(Z)[valid]; pv = prof[valid]
+            # linear fit span vs total absolute variation
+            A = np.polyfit(zi, pv, 1); lin = np.polyval(A, zi)
+            lin_span = float(lin.max() - lin.min())
+            tot_var = float(np.abs(np.diff(pv)).sum()) + 1e-9
+            coherence = lin_span / tot_var           # ~1 = clean slope, ~0 = noise
+            slope_frac = lin_span / (float(np.median(pv)) + 1e-9)  # drift magnitude (fraction)
+        else:
+            coherence = 0.0; slope_frac = 0.0
+        meta_drift = getattr(cal, "beam_drift_frac", None)
+        cal.zdrift_drift_frac = slope_frac
+        cal.zdrift_coherence = coherence
+        # require: a coherent slope (>=0.5), magnitude >= gate, AND metadata says beam drifted
+        # (>=5%) if metadata is available (if not, fall back to measured signals only).
+        meta_ok = (meta_drift is None) or (meta_drift >= 0.05)
+        if coherence >= 0.5 and slope_frac >= zdrift_min_frac and meta_ok:
             cal.zdrift_factor = factor
         else:
-            cal.zdrift_factor = None  # negligible drift -> don't correct
+            cal.zdrift_factor = None  # not a real coherent beam drift -> don't correct
     return cal
 
 
