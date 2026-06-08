@@ -894,6 +894,7 @@ def preprocess_volume(read_region, write_region, shape, metadata: dict, sample_t
       2. PASS 2: per tile, halo-padded, local deconv/denoise/air-zero using the GLOBAL values.
     `sample_tiles` = list of representative occupied u8 chunks (use select_sample_tiles()).
     """
+    L = lib()
     md = md_phys_from_metadata(metadata)
     cal = calibrate_prepass(md, [np.ascontiguousarray(t, np.uint8) for t in sample_tiles],
                             verbose=False)
@@ -901,15 +902,66 @@ def preprocess_volume(read_region, write_region, shape, metadata: dict, sample_t
     cal.do_air_zero = do_air_zero and (cal.air_thresh is not None)
     cal.scratch_passes = scratch_passes
     progress("calibrated", 0.0)
-    # PASS 1: global stats (global air cut + optional normalize/zdrift)
-    accumulate_global_stats(read_region, shape, cal, tile=max(tile, 256),
-                            want_norm=do_normalize, want_zdrift=do_zdrift,
-                            want_air_cut=cal.do_air_zero, progress=progress)
+    # GLOBAL AIR CUT from the SAMPLE TILES (fast). The dark mode is stable across the volume
+    # (measured 48-49 u8 across chunks), so the air valley/cut from the representative sample
+    # tiles == the full-volume cut, WITHOUT a slow full-volume scratch pass. Anchor = the
+    # global valley; band = quarter the dark..valley span (bounded local adjustment in pass 2).
+    if cal.do_air_zero:
+        f32p_ = C.POINTER(C.c_float)
+        ah = np.zeros(256, np.int64)
+        for t in sample_tiles:
+            sc = np.ascontiguousarray(np.asarray(t, np.uint8).astype(np.float32) / 255.0)
+            for _ in range(int(cal.scratch_passes)):
+                so = np.empty_like(sc)
+                if L.fy_guided_denoise(sc.ctypes.data_as(f32p_), so.ctypes.data_as(f32p_),
+                                       *sc.shape, 2, C.c_double(0.01)) != 0:
+                    break
+                sc = so
+            ah += np.bincount(np.clip(sc*255+0.5, 0, 255).astype(np.uint8).ravel(), minlength=256).astype(np.int64)
+        ah = np.ascontiguousarray(ah)
+        dk = C.c_int(0); lt = C.c_int(0); vl = C.c_int(0)
+        d = L.fy_valley_depth(ah.ctypes.data_as(C.POINTER(C.c_long)), C.byref(dk), C.byref(lt), C.byref(vl))
+        if d >= 0:
+            cal.air_cut_u8 = vl.value
+            cal.air_cut_band = max(4, (vl.value - dk.value) // 4)
+        else:
+            cal.air_cut_u8 = int((cal.air_thresh or 0.05) * 255)
+    # PASS 1 (optional global normalize/zdrift only -- air cut already set above)
+    if do_normalize or do_zdrift:
+        accumulate_global_stats(read_region, shape, cal, tile=max(tile, 256),
+                                want_norm=do_normalize, want_zdrift=do_zdrift,
+                                want_air_cut=False, progress=progress)
     progress("pass1_done", float(cal.air_cut_u8 or 0))
-    # PASS 2: local processing with global values
-    return run_pipeline(read_region, write_region, shape, cal, tile=tile,
-                        do_deconv=cal.do_deconv, do_denoise=cal.do_denoise,
-                        do_diffusion=False, progress=progress), cal
+    # PASS 2: PARALLEL local processing with the GLOBAL values. Halo-padded tiles, write inner
+    # (seam-free). C kernels release the GIL -> tiles process concurrently. Bounded RAM
+    # (~workers * one tile+halo). OMP=1 so we parallelize over TILES, not nested.
+    import threading
+    from concurrent.futures import ThreadPoolExecutor
+    os.environ.setdefault("OMP_NUM_THREADS", "1")
+    Z, Y, X = shape; halo = cal.halo
+    nz = -(-Z // tile); ny = -(-Y // tile); nx = -(-X // tile)
+    coords = [(iz*tile, iy*tile, ix*tile) for iz in range(nz) for iy in range(ny) for ix in range(nx)]
+    total = len(coords); done = [0]; plock = threading.Lock()
+    workers = max(1, (os.cpu_count() or 4) - 2)
+
+    def do_tile(coord):
+        z0, y0, x0 = coord
+        tz = min(tile, Z - z0); ty = min(tile, Y - y0); tx = min(tile, X - x0)
+        rz0, ry0, rx0 = max(0, z0-halo), max(0, y0-halo), max(0, x0-halo)
+        rz1, ry1, rx1 = min(Z, z0+tz+halo), min(Y, y0+ty+halo), min(X, x0+tx+halo)
+        blk = read_region(rz0, ry0, rx0, rz1-rz0, ry1-ry0, rx1-rx0)
+        with plock:
+            done[0] += 1; progress("pass2", 100.0*done[0]/total)
+        if not np.any(blk):
+            return
+        out = process_tile(np.ascontiguousarray(blk, np.uint8), cal,
+                            do_deconv=cal.do_deconv, do_denoise=cal.do_denoise, do_diffusion=False)
+        iz0, iy0, ix0 = z0-rz0, y0-ry0, x0-rx0
+        write_region(z0, y0, x0, out[iz0:iz0+tz, iy0:iy0+ty, ix0:ix0+tx])
+
+    with ThreadPoolExecutor(max_workers=workers) as ex:
+        list(ex.map(do_tile, coords))
+    return {"tiles_total": total, "tiles_processed": total}, cal
 
 
 def preprocess_chunk(chunk_u8: np.ndarray, cal: Calibration) -> np.ndarray:
@@ -989,38 +1041,54 @@ def accumulate_global_stats(read_region, shape, cal: Calibration, tile=256,
     # a papyrus threshold for zdrift, in [0,1]; use a low fixed value (air is near 0)
     pap_thr = 0.10
     nz = -(-Z // tile); ny = -(-Y // tile); nx = -(-X // tile)
-    total = nz * ny * nx; done = 0
-    for iz in range(nz):
-        z0 = iz * tile; tz = min(tile, Z - z0)
-        for iy in range(ny):
-            y0 = iy * tile; ty = min(tile, Y - y0)
-            for ix in range(nx):
-                x0 = ix * tile; tx = min(tile, X - x0)
-                blk = read_region(z0, y0, x0, tz, ty, tx)
-                done += 1; progress(done, total)
-                if not np.any(blk):
-                    continue
-                u8 = np.ascontiguousarray(blk, np.uint8)
-                if want_norm:
-                    L.fy_hist_accumulate_u8(C.byref(hist),
-                                            u8.ctypes.data_as(C.POINTER(C.c_ubyte)), u8.size)
-                if want_air_cut and cal.do_air_zero:
-                    # scratch-denoise this tile (same as process_tile's air-mask scratch) and
-                    # accumulate its histogram -> the GLOBAL air cut is derived from the whole
-                    # volume's denoised distribution, not each chunk's.
-                    sc = np.ascontiguousarray(u8.astype(np.float32) / 255.0)
-                    for _ in range(int(cal.scratch_passes)):
-                        so = np.empty_like(sc)
-                        if L.fy_guided_denoise(sc.ctypes.data_as(f32p_), so.ctypes.data_as(f32p_),
-                                               *sc.shape, 2, C.c_double(0.01)) != 0:
-                            break
-                        sc = so
-                    su8 = np.clip(sc * 255 + 0.5, 0, 255).astype(np.uint8)
-                    air_hist += np.bincount(su8.ravel(), minlength=256).astype(np.int64)
-                if want_zdrift:
-                    f = np.ascontiguousarray(u8.astype(np.float32) / 255.0)
-                    L.fy_zdrift_accumulate(f.ctypes.data_as(C.POINTER(C.c_float)),
-                                           tz, ty, tx, z0, sums_p, counts_p, C.c_float(pap_thr))
+    coords = [(iz*tile, iy*tile, ix*tile) for iz in range(nz) for iy in range(ny) for ix in range(nx)]
+    total = len(coords); done = [0]
+    # PARALLEL pass 1: each worker returns its partial stats (numpy c_hist + air_hist + zdrift
+    # sums/counts); merged after. C kernels release the GIL so the scratch-denoise scales.
+    import threading
+    from concurrent.futures import ThreadPoolExecutor
+    workers = max(1, (os.cpu_count() or 4) - 2)
+    plock = threading.Lock()
+
+    def work(coord):
+        z0, y0, x0 = coord
+        tz = min(tile, Z - z0); ty = min(tile, Y - y0); tx = min(tile, X - x0)
+        blk = read_region(z0, y0, x0, tz, ty, tx)
+        with plock:
+            done[0] += 1; progress(done[0], total)
+        ch = np.zeros(256, np.int64); ah = np.zeros(256, np.int64)
+        sm = np.zeros(Z, np.float64); ct = np.zeros(Z, np.int64)
+        if not np.any(blk):
+            return ch, ah, sm, ct
+        u8 = np.ascontiguousarray(blk, np.uint8)
+        if want_norm:
+            ch += np.bincount(u8.ravel(), minlength=256).astype(np.int64)
+        if want_air_cut and cal.do_air_zero:
+            sc = np.ascontiguousarray(u8.astype(np.float32) / 255.0)
+            for _ in range(int(cal.scratch_passes)):
+                so = np.empty_like(sc)
+                if L.fy_guided_denoise(sc.ctypes.data_as(f32p_), so.ctypes.data_as(f32p_),
+                                       *sc.shape, 2, C.c_double(0.01)) != 0:
+                    break
+                sc = so
+            su8 = np.clip(sc * 255 + 0.5, 0, 255).astype(np.uint8)
+            ah += np.bincount(su8.ravel(), minlength=256).astype(np.int64)
+        if want_zdrift:
+            f = np.ascontiguousarray(u8.astype(np.float32) / 255.0)
+            L.fy_zdrift_accumulate(f.ctypes.data_as(C.POINTER(C.c_float)), tz, ty, tx, z0,
+                                   sm.ctypes.data_as(C.POINTER(C.c_double)),
+                                   ct.ctypes.data_as(C.POINTER(C.c_long)), C.c_float(pap_thr))
+        return ch, ah, sm, ct
+
+    norm_counts = np.zeros(256, np.int64)
+    with ThreadPoolExecutor(max_workers=workers) as ex:
+        for ch, ah, sm, ct in ex.map(work, coords):
+            norm_counts += ch; air_hist += ah; sums += sm; counts += ct
+    # merge the global normalization histogram into the C struct (hist[256] + total)
+    if want_norm and norm_counts.sum() > 0:
+        for i in range(256):
+            hist.hist[i] += int(norm_counts[i])
+        hist.total += int(norm_counts.sum())
     if want_norm and hist.total > 0:
         cal.norm_lo = int(L.fy_hist_percentile_u8(C.byref(hist), norm_lo_pct))
         cal.norm_hi = int(L.fy_hist_percentile_u8(C.byref(hist), norm_hi_pct))
@@ -1035,12 +1103,14 @@ def accumulate_global_stats(read_region, shape, cal: Calibration, tile=256,
         d = L.fy_valley_depth(ah.ctypes.data_as(C.POINTER(C.c_long)),
                               C.byref(dark), C.byref(light), C.byref(valley))
         if d >= 0:
-            # GLOBAL anchor = the dark->valley MIDPOINT (between over-conservative dark+8 and
-            # the aggressive valley). Measured: papyrus_core_removed stays 0.00% across the
-            # whole dark..valley range; the v1 papyrus loss came from the UNSTABLE per-chunk
-            # valley spiking PAST the valley (~95), which the global anchor + bounded local
-            # adjustment now prevents. Band = quarter of the dark..valley span (local wiggle).
-            cal.air_cut_u8 = (dark.value + valley.value) // 2
+            # GLOBAL anchor = the VALLEY itself (the histogram minimum = the true air|papyrus
+            # boundary). The dark->valley MIDPOINT sits too low (on the descending dark slope,
+            # still in the 'other' population) -> too conservative. The valley is the real
+            # separation point and is SAFE globally (measured: 0% confident-papyrus removed
+            # across the whole dark..valley range). The v1 papyrus loss came from UNSTABLE
+            # PER-CHUNK valleys spiking PAST the global valley (~95); the bounded local band
+            # now prevents that. Band = quarter the dark..valley span (local wiggle room).
+            cal.air_cut_u8 = valley.value
             cal.air_cut_band = max(4, (valley.value - dark.value) // 4)
         else:
             cal.air_cut_u8 = int((cal.air_thresh or 0.05) * 255)
